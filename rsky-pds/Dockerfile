@@ -7,6 +7,7 @@ FROM rustlang/rust:nightly-slim AS build-env
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
+    libpq-dev \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /dockerbuild
@@ -67,6 +68,7 @@ FROM debian:bullseye-slim
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl1.1 \
+    libpq5 \
     wget \
     && rm -rf /var/lib/apt/lists/*
 
