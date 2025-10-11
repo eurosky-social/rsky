@@ -11,23 +11,36 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /dockerbuild
 
-# Copy only necessary Cargo.toml files for rsky-pds and its dependencies
+# Copy workspace manifest and remove rsky-relay (requires Rust nightly edition2024)
 COPY Cargo.toml Cargo.lock ./
+RUN sed -i '/"rsky-relay",/d' Cargo.toml
+
+# Copy all workspace member Cargo.toml files (except rsky-relay)
 COPY rsky-pds/Cargo.toml rsky-pds/
 COPY rsky-common/Cargo.toml rsky-common/
 COPY rsky-crypto/Cargo.toml rsky-crypto/
+COPY rsky-feedgen/Cargo.toml rsky-feedgen/
+COPY rsky-firehose/Cargo.toml rsky-firehose/
 COPY rsky-identity/Cargo.toml rsky-identity/
+COPY rsky-jetstream-subscriber/Cargo.toml rsky-jetstream-subscriber/
+COPY rsky-labeler/Cargo.toml rsky-labeler/
 COPY rsky-lexicon/Cargo.toml rsky-lexicon/
 COPY rsky-repo/Cargo.toml rsky-repo/
+COPY rsky-satnav/Cargo.toml rsky-satnav/
 COPY rsky-syntax/Cargo.toml rsky-syntax/
 
 # Create dummy source files to cache dependencies
 RUN mkdir -p rsky-pds/src && echo "fn main() {}" > rsky-pds/src/main.rs
 RUN mkdir -p rsky-common/src && echo "" > rsky-common/src/lib.rs
 RUN mkdir -p rsky-crypto/src && echo "" > rsky-crypto/src/lib.rs
+RUN mkdir -p rsky-feedgen/src && echo "" > rsky-feedgen/src/lib.rs
+RUN mkdir -p rsky-firehose/src && echo "" > rsky-firehose/src/lib.rs
 RUN mkdir -p rsky-identity/src && echo "" > rsky-identity/src/lib.rs
+RUN mkdir -p rsky-jetstream-subscriber/src && echo "" > rsky-jetstream-subscriber/src/lib.rs
+RUN mkdir -p rsky-labeler/src && echo "" > rsky-labeler/src/lib.rs
 RUN mkdir -p rsky-lexicon/src && echo "" > rsky-lexicon/src/lib.rs
 RUN mkdir -p rsky-repo/src && echo "" > rsky-repo/src/lib.rs
+RUN mkdir -p rsky-satnav/src && echo "" > rsky-satnav/src/lib.rs
 RUN mkdir -p rsky-syntax/src && echo "" > rsky-syntax/src/lib.rs
 
 # Build dependencies with cache mounts
