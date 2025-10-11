@@ -3,7 +3,7 @@
 #   docker build -f ./rsky-pds/Dockerfile -t rsky-pds .
 
 ### Compile stage
-FROM rust:1.83-slim AS build-env
+FROM rustlang/rust:nightly-slim AS build-env
 RUN apt-get update && apt-get install -y \
     pkg-config \
     libssl-dev \
@@ -11,11 +11,10 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /dockerbuild
 
-# Copy workspace manifest and remove rsky-relay (requires Rust nightly edition2024)
+# Copy workspace manifest
 COPY Cargo.toml Cargo.lock ./
-RUN sed -i '/"rsky-relay",/d' Cargo.toml
 
-# Copy all workspace member Cargo.toml files (except rsky-relay)
+# Copy all workspace member Cargo.toml files
 COPY rsky-pds/Cargo.toml rsky-pds/
 COPY rsky-common/Cargo.toml rsky-common/
 COPY rsky-crypto/Cargo.toml rsky-crypto/
@@ -25,6 +24,7 @@ COPY rsky-identity/Cargo.toml rsky-identity/
 COPY rsky-jetstream-subscriber/Cargo.toml rsky-jetstream-subscriber/
 COPY rsky-labeler/Cargo.toml rsky-labeler/
 COPY rsky-lexicon/Cargo.toml rsky-lexicon/
+COPY rsky-relay/Cargo.toml rsky-relay/
 COPY rsky-repo/Cargo.toml rsky-repo/
 COPY rsky-satnav/Cargo.toml rsky-satnav/
 COPY rsky-syntax/Cargo.toml rsky-syntax/
@@ -39,6 +39,7 @@ RUN mkdir -p rsky-identity/src && echo "" > rsky-identity/src/lib.rs
 RUN mkdir -p rsky-jetstream-subscriber/src && echo "" > rsky-jetstream-subscriber/src/lib.rs
 RUN mkdir -p rsky-labeler/src && echo "" > rsky-labeler/src/lib.rs
 RUN mkdir -p rsky-lexicon/src && echo "" > rsky-lexicon/src/lib.rs
+RUN mkdir -p rsky-relay/src && echo "" > rsky-relay/src/lib.rs
 RUN mkdir -p rsky-repo/src && echo "" > rsky-repo/src/lib.rs
 RUN mkdir -p rsky-satnav/src && echo "" > rsky-satnav/src/lib.rs
 RUN mkdir -p rsky-syntax/src && echo "" > rsky-syntax/src/lib.rs
