@@ -35,7 +35,9 @@ if grep -q '\[workspace\]' Cargo.toml; then
   if echo "$MEMBERS_SECTION" | grep -q 'members.*=.*\['; then
     # Array format: members = ["pkg1", "pkg2"]
     MEMBERS_LIST=$(echo "$MEMBERS_SECTION" | grep -o '"[^"]*"' | tr -d '"')
-    readarray -t WORKSPACE_MEMBERS <<< "$MEMBERS_LIST"
+    if [[ -n "$MEMBERS_LIST" ]]; then
+      readarray -t WORKSPACE_MEMBERS <<< "$MEMBERS_LIST"
+    fi
   else
     # Fallback: Try to find any directory that contains a Cargo.toml file
     echo "Falling back to finding all directories with Cargo.toml..."
@@ -62,6 +64,15 @@ if [ ${#WORKSPACE_MEMBERS[@]} -eq 0 ]; then
 fi
 
 echo "Found workspace members: ${WORKSPACE_MEMBERS[*]}"
+
+# Remove empty strings from array
+TEMP_MEMBERS=()
+for member in "${WORKSPACE_MEMBERS[@]}"; do
+  if [[ -n "$member" ]]; then
+    TEMP_MEMBERS+=("$member")
+  fi
+done
+WORKSPACE_MEMBERS=("${TEMP_MEMBERS[@]}")
 
 # Define packages to skip
 SKIP_PACKAGES=("cypher/frontend" "cypher/backend" "rsky-pdsadmin")
@@ -157,7 +168,15 @@ if [ ${#FILTERED_MEMBERS[@]} -eq 0 ]; then
     fi
 fi
 
+# Final cleanup: remove any empty strings that might have slipped through
+FINAL_MEMBERS=()
+for member in "${FILTERED_MEMBERS[@]}"; do
+  if [[ -n "$member" ]]; then
+    FINAL_MEMBERS+=("$member")
+  fi
+done
+
 # Convert to JSON array for matrix - without jq dependency
-JSON_MEMBERS=$(array_to_json "${FILTERED_MEMBERS[@]}")
+JSON_MEMBERS=$(array_to_json "${FINAL_MEMBERS[@]}")
 echo "workspace_members=$JSON_MEMBERS" >> "$GITHUB_OUTPUT"
 echo "Found workspace members to process: $JSON_MEMBERS"
