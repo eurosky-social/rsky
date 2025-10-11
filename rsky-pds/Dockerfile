@@ -1,5 +1,6 @@
 # Use the official Rust image.
 # https://hub.docker.com/_/rust
+# Trigger build for eurosky-social registry
 FROM rust AS builder
 
 # Copy local code to the container image.
