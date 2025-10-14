@@ -63,11 +63,11 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     cp target/release/rsky-pds /rsky-pds
 
 ### Run stage
-FROM debian:bullseye-slim
+FROM debian:trixie-slim
 
 RUN apt-get update && apt-get install -y \
     ca-certificates \
-    libssl1.1 \
+    libssl3t64 \
     libpq5 \
     wget \
     && rm -rf /var/lib/apt/lists/*
