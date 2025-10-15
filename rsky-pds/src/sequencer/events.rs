@@ -81,6 +81,7 @@ pub struct AccountEvt {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct SyncEvt {
     pub did: String,
+    #[serde(with = "serde_bytes")]
     pub blocks: Vec<u8>,
     pub rev: String,
 }
