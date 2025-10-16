@@ -250,11 +250,15 @@ pub async fn validate_inputs_for_local_pds(
     }
 
     //Invite Code Validation
-    let invite_code = if cfg.invites.required && input.invite_code.is_none() {
-        return Err(ApiError::InvalidInviteCode);
-    } else {
-        input.invite_code.clone()
+    let invite_code = match &input.invite_code {
+        Some(code) if code.is_empty() => None, // Treat empty string as None
+        Some(code) => Some(code.clone()),
+        None => None,
     };
+
+    if cfg.invites.required && invite_code.is_none() {
+        return Err(ApiError::InvalidInviteCode);
+    }
 
     //Email Validation
     if input.email.is_none() {

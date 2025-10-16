@@ -4,6 +4,9 @@ FROM rust
 
 # Copy local code to the container image.
 WORKDIR /usr/src/rsky
+
+# Enable incremental compilation for faster rebuilds
+ENV CARGO_INCREMENTAL=1
 COPY . .
 
 # Install production dependencies and build a release artifact.

@@ -12,6 +12,9 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /dockerbuild
 
+# Enable incremental compilation for faster rebuilds
+ENV CARGO_INCREMENTAL=1
+
 # Copy workspace manifest
 COPY Cargo.toml Cargo.lock ./
 
