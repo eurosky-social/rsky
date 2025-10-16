@@ -309,24 +309,27 @@ impl ActorStore {
                     match write {
                         // There should be no current record for a create
                         PreparedWrite::Create(_) if current_record.is_some() => {
-                            return Err(
-                                FormatCommitError::BadRecordSwap(format!("{:?}", current_record))
-                                    .into(),
-                            );
+                            return Err(FormatCommitError::BadRecordSwap(format!(
+                                "{:?}",
+                                current_record
+                            ))
+                            .into());
                         }
                         // There should be a current record for an update
                         PreparedWrite::Update(_) if current_record.is_none() => {
-                            return Err(
-                                FormatCommitError::BadRecordSwap(format!("{:?}", current_record))
-                                    .into(),
-                            );
+                            return Err(FormatCommitError::BadRecordSwap(format!(
+                                "{:?}",
+                                current_record
+                            ))
+                            .into());
                         }
                         // There should be a current record for a delete
                         PreparedWrite::Delete(_) if current_record.is_none() => {
-                            return Err(
-                                FormatCommitError::BadRecordSwap(format!("{:?}", current_record))
-                                    .into(),
-                            );
+                            return Err(FormatCommitError::BadRecordSwap(format!(
+                                "{:?}",
+                                current_record
+                            ))
+                            .into());
                         }
                         _ => {}
                     }
