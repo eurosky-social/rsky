@@ -38,6 +38,13 @@ pub struct SubscribeReposCommit {
     pub blocks: Vec<u8>,
     pub ops: Vec<SubscribeReposCommitOperation>,
     pub blobs: Vec<String>,
+    #[serde(
+        rename = "prevData",
+        skip_serializing_if = "Option::is_none",
+        default = "default_resource",
+        deserialize_with = "deserialize_option_cid_v1"
+    )]
+    pub prev_data: Option<Cid>,
 }
 
 /// Get the current commit CID & revision of the specified repo. Does not require auth.
@@ -113,6 +120,7 @@ pub struct SubscribeReposIdentity {
 pub struct SubscribeReposSync {
     pub seq: i64,
     pub did: String,
+    #[serde(with = "serde_bytes")]
     pub blocks: Vec<u8>,
     pub rev: String,
     pub time: DateTime<Utc>,

@@ -270,11 +270,6 @@ impl Stream for Sequencer {
             limit: Some(1000),
         })) {
             Err(err) => {
-                tracing::error!(
-                    "@LOG: sequencer failed to poll db, err: {}, last_seen: {:?}",
-                    err.to_string(),
-                    self.last_seen
-                );
                 self.waker = Some(cx.waker().clone());
                 futures::executor::block_on(self.exponential_backoff());
                 Poll::Ready(Some(Err(err)))

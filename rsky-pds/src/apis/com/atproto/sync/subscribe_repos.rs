@@ -169,6 +169,7 @@ pub async fn subscribe_repos<'a>(
                                     action: op.action.to_string()
                                 }).collect::<Vec<SubscribeReposCommitOperation>>(),
                                 blobs: blobs.into_iter().map(|blob| blob.to_string()).collect::<Vec<String>>(),
+                                prev_data,
                             };
                             let message_frame = MessageFrame::new(subscribe_commit_evt, Some(MessageFrameOpts { r#type: Some(format!("#{0}",r#type)) }));
                             let binary = match message_frame.to_bytes() {
