@@ -140,6 +140,23 @@ pub fn backfiller_timeout() -> Duration {
     Duration::from_secs(*BACKFILLER_TIMEOUT_SECS)
 }
 
+// Overall per-job timeout in the backfill pipeline. Bounds the WHOLE job
+// (DID resolution + CAR fetch + parse + enqueue) so a wedged upstream or a
+// pathological repo fails into the retry/dead-letter path instead of
+// occupying a worker forever. Must exceed the HTTP fetch timeout
+// (BACKFILLER_TIMEOUT_SECS) plus parse time.
+pub static BACKFILLER_JOB_TIMEOUT_SECS: LazyLock<u64> = LazyLock::new(|| {
+    std::env::var("BACKFILLER_JOB_TIMEOUT_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or_else(|| *BACKFILLER_TIMEOUT_SECS * 2) // Default: 2x fetch timeout (240s)
+});
+
+#[must_use]
+pub fn backfiller_job_timeout() -> Duration {
+    Duration::from_secs(*BACKFILLER_JOB_TIMEOUT_SECS)
+}
+
 // Inline processing concurrency for firehose events
 // Should be proportional to DB_POOL_SIZE to avoid excessive connection contention
 /// Live indexing updates aggregates inline (`post_agg`/`profile_agg`). Set `LIVE_AGGREGATES=false`

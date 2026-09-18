@@ -1,7 +1,7 @@
 mod tests;
 
 use crate::SHUTDOWN;
-use crate::config::{WORKERS_BACKFILLER, backfiller_timeout};
+use crate::config::{WORKERS_BACKFILLER, backfiller_job_timeout, backfiller_timeout};
 use crate::storage::Storage;
 use crate::types::{BackfillJob, IndexJob, WintermuteError, WriteAction};
 use dashmap::DashMap;
@@ -25,6 +25,10 @@ pub struct BackfillerManager {
     pds_cache: Arc<DashMap<String, String>>,
     /// Where the actor generations are read before each fetch.
     generations: Option<deadpool_postgres::Pool>,
+    /// Upper bound on one whole job (resolve + fetch + parse + enqueue).
+    /// A job exceeding it is failed into the retry/dead-letter path instead
+    /// of occupying its worker forever.
+    job_timeout: Duration,
 }
 
 /// Boxed future returned by a pipeline job handler.
@@ -56,10 +60,11 @@ impl BackfillerManager {
         let http_client = crate::outbound::client()?;
 
         tracing::info!(
-            "backfiller config: workers={}, channel_cap={}, timeout={:?}",
+            "backfiller config: workers={}, channel_cap={}, fetch_timeout={:?}, job_timeout={:?}",
             workers,
             workers * 2,
-            backfiller_timeout()
+            backfiller_timeout(),
+            backfiller_job_timeout()
         );
 
         Ok(Self {
@@ -68,6 +73,7 @@ impl BackfillerManager {
             http_client,
             generations: None,
             pds_cache: Arc::new(DashMap::new()),
+            job_timeout: backfiller_job_timeout(),
         })
     }
 
@@ -145,6 +151,7 @@ impl BackfillerManager {
         );
 
         // Spawn worker tasks -- each loops forever, pulling from the channel
+        let job_timeout = self.job_timeout;
         let mut worker_handles = Vec::with_capacity(self.workers);
         for worker_id in 0..self.workers {
             let rx = Arc::clone(&rx);
@@ -164,7 +171,17 @@ impl BackfillerManager {
                         break;
                     };
 
-                    match handler(job.clone()).await {
+                    // Bound the whole job: a wedged upstream must fail this
+                    // job (into the retry/dead-letter path below) instead of
+                    // occupying the worker forever.
+                    let result =
+                        match tokio::time::timeout(job_timeout, handler(job.clone())).await {
+                            Ok(result) => result,
+                            Err(_elapsed) => Err(WintermuteError::Other(format!(
+                                "job timed out after {job_timeout:?}"
+                            ))),
+                        };
+                    match result {
                         Ok(()) => {}
                         Err(e) => {
                             tracing::error!("worker {worker_id}: failed {}: {e}", job.did);
