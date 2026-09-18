@@ -1012,8 +1012,26 @@ impl Storage {
         Ok(self.repo_backfill.len()?)
     }
 
+    /// Approximate `repo_backfill` count (includes not-yet-compacted
+    /// tombstones). O(1); the exact `len()` walks the whole partition and
+    /// must stay off hot paths.
+    #[must_use]
+    pub fn repo_backfill_approx_len(&self) -> usize {
+        self.repo_backfill.approximate_len()
+    }
+
     pub fn firehose_live_len(&self) -> Result<usize, WintermuteError> {
         Ok(self.firehose_live.len()? + self.firehose_live_seq.len()?)
+    }
+
+    /// Approximate live-queue count (includes not-yet-compacted tombstones,
+    /// so it over-reports after heavy draining until compaction catches up).
+    /// O(1); fjall's exact `len()` walks the whole partition -- calling it on
+    /// a large backlog pinned a core for minutes per call and filled the
+    /// block cache.
+    #[must_use]
+    pub fn firehose_live_approx_len(&self) -> usize {
+        self.firehose_live.approximate_len() + self.firehose_live_seq.approximate_len()
     }
 
     pub fn firehose_backfill_len(&self) -> Result<usize, WintermuteError> {
@@ -1031,6 +1049,13 @@ impl Storage {
 
     pub fn label_live_len(&self) -> Result<usize, WintermuteError> {
         Ok(self.label_live.len()?)
+    }
+
+    /// Approximate `label_live` count (includes not-yet-compacted
+    /// tombstones). O(1); see [`Storage::firehose_live_approx_len`].
+    #[must_use]
+    pub fn label_live_approx_len(&self) -> usize {
+        self.label_live.approximate_len()
     }
 
     /// Peek at the first N items in `repo_backfill` without removing them

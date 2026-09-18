@@ -816,18 +816,22 @@ impl IndexerManager {
     }
 
     fn update_queue_metrics_for(storage: &Storage) {
-        if let Ok(live_len) = storage.firehose_live_len() {
-            crate::metrics::INGESTER_FIREHOSE_LIVE_LENGTH
-                .set(i64::try_from(live_len).unwrap_or(i64::MAX));
-        }
+        // Approximate counts only: fjall's exact len() walks the whole
+        // partition through the MVCC merge iterator. On a multi-GB backlog
+        // that scan pinned a core for the process's whole lifetime, filled
+        // the block cache, and starved the drain (seen in production at
+        // 130GB RSS). The gauges stay exact via inc/sub on the hot paths;
+        // this seed only corrects post-restart drift.
+        let live_len = storage.firehose_live_approx_len();
+        crate::metrics::INGESTER_FIREHOSE_LIVE_LENGTH
+            .set(i64::try_from(live_len).unwrap_or(i64::MAX));
         if let Ok(backfill_len) = storage.firehose_backfill_len() {
             crate::metrics::INGESTER_FIREHOSE_BACKFILL_LENGTH
                 .set(i64::try_from(backfill_len).unwrap_or(i64::MAX));
         }
-        if let Ok(label_len) = storage.label_live_len() {
-            crate::metrics::INGESTER_LABEL_LIVE_LENGTH
-                .set(i64::try_from(label_len).unwrap_or(i64::MAX));
-        }
+        let label_len = storage.label_live_approx_len();
+        crate::metrics::INGESTER_LABEL_LIVE_LENGTH
+            .set(i64::try_from(label_len).unwrap_or(i64::MAX));
     }
 
     #[cfg(test)]

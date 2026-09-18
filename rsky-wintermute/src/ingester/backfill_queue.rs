@@ -166,10 +166,11 @@ pub async fn populate_backfill_queue(
                 .await?;
             cursor = Some(next_cursor.clone());
 
-            // Log every 10K repos
+            // Log every 10K repos. Approximate count: the exact len() walks
+            // the whole partition and gets slower as the queue grows.
             if total_enumerated / 10_000 > last_log_count {
                 last_log_count = total_enumerated / 10_000;
-                let queue_len = storage.repo_backfill_len().unwrap_or(0);
+                let queue_len = storage.repo_backfill_approx_len();
                 tracing::info!(
                     "enumerated {} repos, cursor={}, queue_len={}",
                     total_enumerated,
@@ -178,7 +179,7 @@ pub async fn populate_backfill_queue(
                 );
             }
         } else {
-            let queue_len = storage.repo_backfill_len().unwrap_or(0);
+            let queue_len = storage.repo_backfill_approx_len();
             tracing::info!(
                 "backfill enumeration complete: {} repos, queue_len={}",
                 total_enumerated,
