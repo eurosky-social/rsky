@@ -577,6 +577,7 @@ mod backfiller_tests {
     // regresses, they fail by timing out waiting for the drain.
     // =========================================================================
 
+    use crate::backfiller::{JobFuture, JobHandler};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::time::{Duration, Instant};
@@ -700,6 +701,109 @@ mod backfiller_tests {
         assert!(
             !pipeline.is_finished(),
             "pipeline should stay alive after draining the queue"
+        );
+
+        pipeline.abort();
+    }
+
+    /// Regression test for stall mode 2: a panic in job processing must be
+    /// contained -- the job fails into the retry/dead-letter path and the
+    /// worker survives to process the next job.
+    ///
+    /// Uses the real `run_pipeline` with an injected handler that panics on
+    /// every job (the production equivalent is a panic inside rsky_repo
+    /// CAR/MST parsing on a malformed repo). Every job must be attempted
+    /// 3 times (initial + 2 retries) and dead-lettered, fully draining the
+    /// queue. Before the fix, each worker died on its first panic and the
+    /// pipeline froze with the queue still full.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_pipeline_survives_worker_panics() {
+        const JOBS: usize = 6;
+
+        // These tests need SHUTDOWN to stay false for their whole duration.
+        let _shutdown_guard = SHUTDOWN_LOCK.lock().await;
+        let (storage, _dir) = setup_test_storage();
+        let storage = Arc::new(storage);
+
+        for i in 0..JOBS {
+            storage
+                .enqueue_backfill(&BackfillJob {
+                    did: format!("did:plc:poison{i:03}"),
+                    retry_count: 0,
+                    priority: false,
+                })
+                .unwrap();
+        }
+        assert_eq!(storage.repo_backfill_len().unwrap(), JOBS);
+
+        let manager = BackfillerManager {
+            workers: 2,
+            storage: Arc::clone(&storage),
+            http_client: rsky_identity::safe_fetch::SafeClient::new(
+                rsky_identity::safe_fetch::NetworkPolicy::PERMISSIVE,
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+            pds_cache: Arc::new(dashmap::DashMap::new()),
+            generations: None,
+            job_timeout: Duration::from_secs(30),
+        };
+
+        // Handler that panics on every job, simulating a poison repo.
+        // Counts invocations: surviving workers keep processing, so every
+        // job gets its full 3 attempts.
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let handler: Arc<JobHandler> = {
+            let handler_calls = Arc::clone(&handler_calls);
+            Arc::new(move |job: BackfillJob| -> JobFuture {
+                let handler_calls = Arc::clone(&handler_calls);
+                Box::pin(async move {
+                    handler_calls.fetch_add(1, AtomicOrdering::Relaxed);
+                    panic!("simulated poison repo panic for {}", job.did);
+                })
+            })
+        };
+
+        let pipeline = tokio::spawn(async move { manager.run_pipeline(&handler).await });
+
+        // Surviving workers must keep processing: every job gets its full
+        // retry budget of 3 attempts. Before the fix, each worker died on its
+        // first panic and the count froze at 2.
+        let all_attempted = wait_for(Duration::from_secs(30), || {
+            handler_calls.load(AtomicOrdering::Relaxed) >= JOBS * 3
+        })
+        .await;
+        assert!(
+            all_attempted,
+            "expected {} handler invocations, got {} -- workers did not \
+             survive the panics",
+            JOBS * 3,
+            handler_calls.load(AtomicOrdering::Relaxed)
+        );
+
+        // Dead-lettering caps every job at exactly 3 attempts.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let calls = handler_calls.load(AtomicOrdering::Relaxed);
+        assert_eq!(
+            calls,
+            JOBS * 3,
+            "jobs were attempted more than 3 times -- dead-lettering regressed"
+        );
+
+        // Once everything is dead-lettered the queue must be fully drained.
+        let drained = wait_for(Duration::from_secs(10), || {
+            storage.repo_backfill_len().unwrap() == 0
+        })
+        .await;
+        assert!(
+            drained,
+            "queue should fully drain once all attempts are dead-lettered"
+        );
+
+        // The pipeline survives the panics: it idles on the empty queue.
+        assert!(
+            !pipeline.is_finished(),
+            "pipeline should stay alive after containing worker panics"
         );
 
         pipeline.abort();

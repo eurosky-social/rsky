@@ -5,6 +5,7 @@ use crate::config::{WORKERS_BACKFILLER, backfiller_job_timeout, backfiller_timeo
 use crate::storage::Storage;
 use crate::types::{BackfillJob, IndexJob, WintermuteError, WriteAction};
 use dashmap::DashMap;
+use futures::FutureExt;
 use iroh_car::CarReader;
 use rsky_identity::IdResolver;
 use rsky_identity::safe_fetch::{Redirects, SafeClient};
@@ -171,16 +172,29 @@ impl BackfillerManager {
                         break;
                     };
 
-                    // Bound the whole job: a wedged upstream must fail this
-                    // job (into the retry/dead-letter path below) instead of
-                    // occupying the worker forever.
-                    let result =
-                        match tokio::time::timeout(job_timeout, handler(job.clone())).await {
-                            Ok(result) => result,
-                            Err(_elapsed) => Err(WintermuteError::Other(format!(
-                                "job timed out after {job_timeout:?}"
-                            ))),
-                        };
+                    // Bound the whole job and contain panics: a wedged
+                    // upstream or a poison repo must fail this job (into the
+                    // retry/dead-letter path below) instead of occupying the
+                    // worker forever or killing it.
+                    let attempt = tokio::time::timeout(
+                        job_timeout,
+                        std::panic::AssertUnwindSafe(handler(job.clone())).catch_unwind(),
+                    )
+                    .await;
+                    let result = match attempt {
+                        Ok(Ok(result)) => result,
+                        Ok(Err(panic)) => {
+                            let msg = panic
+                                .downcast_ref::<&str>()
+                                .map(|s| (*s).to_owned())
+                                .or_else(|| panic.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "unknown panic payload".to_owned());
+                            Err(WintermuteError::Other(format!("job panicked: {msg}")))
+                        }
+                        Err(_elapsed) => Err(WintermuteError::Other(format!(
+                            "job timed out after {job_timeout:?}"
+                        ))),
+                    };
                     match result {
                         Ok(()) => {}
                         Err(e) => {
