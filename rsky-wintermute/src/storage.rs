@@ -2,6 +2,16 @@ use crate::config::{BLOCK_SIZE, CACHE_SIZE, FSYNC_MS, MEMTABLE_SIZE, WRITE_BUFFE
 
 const LIVE_SEQ_READ_CURSOR: &str = "live_seq_read";
 const LIVE_LEGACY_DRAINED: &str = "live_legacy_drained";
+// Generation swap of the seq queue partition: the active generation's name is
+// persisted under this cursor key, and a swap alternates between the two
+// names. Deleting a drained generation is the only way to reclaim its
+// tombstone debt: fjall's major compaction cannot be used, because with no
+// snapshots open its GC watermark stays at zero and compacting a queue
+// partition RESURRECTS drained jobs (tombstones drop at the last level while
+// the values they shadow survive).
+const LIVE_SEQ_PARTITION_KEY: &str = "live_seq_partition";
+const LIVE_SEQ_GEN_A: &str = "firehose_live_seq";
+const LIVE_SEQ_GEN_B: &str = "firehose_live_seq_b";
 use crate::types::{BackfillJob, FirehoseEvent, IndexJob, WintermuteError};
 use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle};
 use heed::types::Bytes;
@@ -20,7 +30,6 @@ const LMDB_MAP_SIZE: usize = if cfg!(test) {
 };
 
 pub struct Storage {
-    #[allow(dead_code)] // Kept for Fjall keyspace - partitions reference it internally
     db: Arc<Keyspace>,
     firehose_events: PartitionHandle,
     repo_backfill: PartitionHandle,
@@ -28,7 +37,9 @@ pub struct Storage {
     // Sequence-keyed successor to `firehose_live`: monotonic u64 keys mean the
     // read cursor only moves forward and dequeue tombstones are never
     // re-scanned. The legacy uri-keyed partition drains first, then this one.
-    firehose_live_seq: PartitionHandle,
+    // Behind a lock because a generation swap replaces the handle; writers
+    // and readers hold the read side for the duration of their operation.
+    firehose_live_seq: std::sync::RwLock<PartitionHandle>,
     label_live: PartitionHandle,
     cursors: PartitionHandle,
     // LMDB for firehose_backfill - eliminates L0 compaction stalls
@@ -42,6 +53,9 @@ pub struct Storage {
     live_seq_next: AtomicU64,
     legacy_live_drained: AtomicBool,
     live_notify: tokio::sync::Notify,
+    // Tombstone-debt collection for the seq queue: epoch seconds of the last
+    // generation swap.
+    live_seq_last_swap: AtomicU64,
 }
 
 impl Storage {
@@ -114,8 +128,42 @@ impl Storage {
                 .block_size(BLOCK_SIZE),
         )?;
 
+        let label_live = db.open_partition(
+            "label_live",
+            PartitionCreateOptions::default()
+                .max_memtable_size(MEMTABLE_SIZE)
+                .block_size(BLOCK_SIZE),
+        )?;
+
+        let cursors = db.open_partition("cursors", PartitionCreateOptions::default())?;
+
+        // The active seq-queue generation is persisted; anything else in the
+        // key (or its absence) means the original name.
+        let live_seq_name = cursors
+            .get(LIVE_SEQ_PARTITION_KEY.as_bytes())?
+            .filter(|v| v.as_ref() == LIVE_SEQ_GEN_B.as_bytes())
+            .map_or(LIVE_SEQ_GEN_A, |_| LIVE_SEQ_GEN_B);
+        // Delete the inactive generation: normally a no-op on a freshly
+        // created empty partition, but after a crash mid-swap it holds either
+        // a drained generation's tombstones or an unused empty successor.
+        let other_name = if live_seq_name == LIVE_SEQ_GEN_A {
+            LIVE_SEQ_GEN_B
+        } else {
+            LIVE_SEQ_GEN_A
+        };
+        match db.open_partition(other_name, PartitionCreateOptions::default()) {
+            Ok(other) => {
+                if let Err(e) = db.delete_partition(other) {
+                    tracing::warn!("failed to delete inactive live seq generation: {e}");
+                }
+            }
+            Err(e) => {
+                tracing::warn!("failed to open inactive live seq generation for cleanup: {e}");
+            }
+        }
+
         let firehose_live_seq = db.open_partition(
-            "firehose_live_seq",
+            live_seq_name,
             PartitionCreateOptions::default()
                 .max_memtable_size(MEMTABLE_SIZE)
                 .block_size(BLOCK_SIZE),
@@ -125,15 +173,6 @@ impl Storage {
                 .try_into()
                 .map_or(0, |b: [u8; 8]| u64::from_be_bytes(b).saturating_add(1))
         });
-
-        let label_live = db.open_partition(
-            "label_live",
-            PartitionCreateOptions::default()
-                .max_memtable_size(MEMTABLE_SIZE)
-                .block_size(BLOCK_SIZE),
-        )?;
-
-        let cursors = db.open_partition("cursors", PartitionCreateOptions::default())?;
 
         // Open LMDB for firehose_backfill - B+ tree eliminates LSM compaction stalls
         let lmdb_path = path.join("firehose_backfill_lmdb");
@@ -200,7 +239,7 @@ impl Storage {
             firehose_events,
             repo_backfill,
             firehose_live,
-            firehose_live_seq,
+            firehose_live_seq: std::sync::RwLock::new(firehose_live_seq),
             label_live,
             cursors,
             lmdb_env,
@@ -210,7 +249,18 @@ impl Storage {
             live_seq_next: AtomicU64::new(live_seq_start),
             legacy_live_drained: AtomicBool::new(legacy_drained),
             live_notify: tokio::sync::Notify::new(),
+            live_seq_last_swap: AtomicU64::new(0),
         })
+    }
+
+    /// The current seq-queue generation, held for the duration of one
+    /// operation so a concurrent generation swap cannot delete the partition
+    /// under it. Poisoning is impossible to propagate usefully here; recover
+    /// the guard.
+    fn live_seq(&self) -> std::sync::RwLockReadGuard<'_, PartitionHandle> {
+        self.firehose_live_seq
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     pub fn write_firehose_event(
@@ -344,8 +394,7 @@ impl Storage {
         let mut value = Vec::new();
         ciborium::into_writer(job, &mut value)
             .map_err(|e| WintermuteError::Serialization(format!("failed to serialize job: {e}")))?;
-        self.firehose_live_seq
-            .insert(seq.to_be_bytes(), value.as_slice())?;
+        self.live_seq().insert(seq.to_be_bytes(), value.as_slice())?;
         crate::metrics::INGESTER_FIREHOSE_LIVE_LENGTH.inc();
         self.live_notify.notify_one();
         Ok(())
@@ -442,21 +491,12 @@ impl Storage {
 
         let mut results = Vec::with_capacity(limit);
         let mut poisoned: Vec<Vec<u8>> = Vec::new();
+        let live_seq = self.live_seq();
         if let Some(after) = cursor {
             let range = (Bound::Excluded(after), Bound::<Vec<u8>>::Unbounded);
-            Self::collect_live_entries(
-                self.firehose_live_seq.range(range),
-                limit,
-                &mut results,
-                &mut poisoned,
-            )?;
+            Self::collect_live_entries(live_seq.range(range), limit, &mut results, &mut poisoned)?;
         } else {
-            Self::collect_live_entries(
-                self.firehose_live_seq.iter(),
-                limit,
-                &mut results,
-                &mut poisoned,
-            )?;
+            Self::collect_live_entries(live_seq.iter(), limit, &mut results, &mut poisoned)?;
         }
 
         let last_key = results
@@ -467,24 +507,139 @@ impl Storage {
             self.cursors
                 .insert(LIVE_SEQ_READ_CURSOR.as_bytes(), key.as_slice())?;
             *guard = Some(key);
+        } else if results.is_empty() && poisoned.is_empty() {
+            // No staleness probe here: open_db starts the sequence counter
+            // above the persisted cursor, so no entry can ever land at or
+            // below it and an empty scan simply means the queue is drained.
+            // (The old first_key_value() probe walked every tombstone in the
+            // partition on each empty poll, which wedged the drain for hours
+            // once the partition had accumulated a large backlog's
+            // tombstones.) A drained queue is instead the safe moment to
+            // collect the tombstone debt this queue workload accretes.
+            drop(live_seq);
+            self.maybe_swap_live_seq();
+            return Ok(results);
         }
-        // No staleness probe on the empty path: open_db starts the sequence
-        // counter above the persisted cursor, so no entry can ever land at or
-        // below it and an empty scan simply means the queue is drained. The
-        // old first_key_value() probe walked every tombstone in the partition
-        // on each empty poll, which wedged the drain for hours once the
-        // partition had accumulated a large backlog's tombstones.
 
         for (key, _) in &results {
-            self.firehose_live_seq.remove(key.as_slice())?;
+            live_seq.remove(key.as_slice())?;
         }
         for key in &poisoned {
-            self.firehose_live_seq.remove(key.as_slice())?;
+            live_seq.remove(key.as_slice())?;
         }
+        drop(live_seq);
 
         #[allow(clippy::cast_possible_wrap)]
         crate::metrics::INGESTER_FIREHOSE_LIVE_LENGTH.sub((results.len() + poisoned.len()) as i64);
         Ok(results)
+    }
+
+    /// Swaps the seq queue to a fresh generation when the queue is drained
+    /// and enough tombstone debt has accumulated, rate-limited.
+    ///
+    /// A queue is the worst case for an LSM partition: every job is written
+    /// once and deleted once, so drained jobs accrete one tombstone each and
+    /// ordinary compaction never prioritizes the cold, all-dead segments.
+    /// In production this reached billions of tombstones (~17GB) that every
+    /// full-partition operation had to merge-skip. Deleting the drained
+    /// partition and continuing in a fresh one reclaims all of it.
+    fn maybe_swap_live_seq(&self) {
+        /// Dead items to accumulate before a swap is worth it.
+        const DEBT_THRESHOLD: usize = 1_000_000;
+        const MIN_INTERVAL_SECS: u64 = 15 * 60;
+
+        let debt = self.live_seq().approximate_len();
+        if debt < DEBT_THRESHOLD {
+            return;
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let last = self.live_seq_last_swap.load(Ordering::Relaxed);
+        if now.saturating_sub(last) < MIN_INTERVAL_SECS {
+            return;
+        }
+        // A racing swap attempt loses the CAS and skips; the winner stamps
+        // the time before doing the work.
+        if self
+            .live_seq_last_swap
+            .compare_exchange(last, now, Ordering::SeqCst, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+        match self.swap_live_seq_generation() {
+            Ok(true) => {}
+            Ok(false) => tracing::debug!("live seq generation swap skipped: queue not drained"),
+            Err(e) => tracing::error!("live seq generation swap failed: {e}"),
+        }
+    }
+
+    /// Replaces the seq queue partition with a fresh, empty generation and
+    /// deletes the old one, reclaiming its tombstone debt. Only proceeds if
+    /// the queue is verifiably drained under the write lock; the sequence
+    /// counter and read cursor carry over unchanged, so ordering and the
+    /// no-reuse invariant hold across the swap. Returns whether it swapped.
+    fn swap_live_seq_generation(&self) -> Result<bool, WintermuteError> {
+        let current_name = self
+            .cursors
+            .get(LIVE_SEQ_PARTITION_KEY.as_bytes())?
+            .filter(|v| v.as_ref() == LIVE_SEQ_GEN_B.as_bytes())
+            .map_or(LIVE_SEQ_GEN_A, |_| LIVE_SEQ_GEN_B);
+        let next_name = if current_name == LIVE_SEQ_GEN_A {
+            LIVE_SEQ_GEN_B
+        } else {
+            LIVE_SEQ_GEN_A
+        };
+
+        // Create the successor before taking the lock; fails harmlessly if a
+        // previous generation's deletion has not finished cleaning its
+        // directory yet (the swap is retried later).
+        let next = self.db.open_partition(
+            next_name,
+            PartitionCreateOptions::default()
+                .max_memtable_size(MEMTABLE_SIZE)
+                .block_size(BLOCK_SIZE),
+        )?;
+
+        let mut guard = self
+            .firehose_live_seq
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        // Verify the queue is still drained now that no writer can race:
+        // only entries past the read cursor are live, so this probe never
+        // touches the tombstone debt below it. Without a cursor (first ever
+        // batch, or after LIVE_SEQ_CURSOR_RESET) emptiness cannot be checked
+        // cheaply; skip the swap until steady state.
+        let cursor = self
+            .firehose_live_seq_cursor
+            .lock()
+            .map_or(None, |c| c.clone());
+        let Some(after) = cursor else {
+            return Ok(false);
+        };
+        let range = (Bound::Excluded(after), Bound::<Vec<u8>>::Unbounded);
+        if guard.range(range).next().is_some() {
+            return Ok(false);
+        }
+
+        let debt = guard.approximate_len();
+        // Persist the new generation's name first: after a crash beyond this
+        // point the old partition is the inactive name and open_db deletes it.
+        self.cursors
+            .insert(LIVE_SEQ_PARTITION_KEY.as_bytes(), next_name.as_bytes())?;
+        let old = std::mem::replace(&mut *guard, next);
+        drop(guard);
+        self.db.delete_partition(old)?;
+
+        // Re-seed the queue gauge: the debt it was over-reporting is gone.
+        crate::metrics::INGESTER_FIREHOSE_LIVE_LENGTH
+            .set(i64::try_from(self.firehose_live_approx_len()).unwrap_or(i64::MAX));
+        tracing::info!(
+            "live seq queue swapped to generation {next_name}: reclaimed ~{debt} dead items"
+        );
+        Ok(true)
     }
 
     /// Sweep-cursor scan of the legacy uri-keyed partition: resumes after the
@@ -1021,7 +1176,8 @@ impl Storage {
     }
 
     pub fn firehose_live_len(&self) -> Result<usize, WintermuteError> {
-        Ok(self.firehose_live.len()? + self.firehose_live_seq.len()?)
+        let seq_len = self.live_seq().len()?;
+        Ok(self.firehose_live.len()? + seq_len)
     }
 
     /// Approximate live-queue count (includes not-yet-compacted tombstones,
@@ -1031,7 +1187,7 @@ impl Storage {
     /// block cache.
     #[must_use]
     pub fn firehose_live_approx_len(&self) -> usize {
-        self.firehose_live.approximate_len() + self.firehose_live_seq.approximate_len()
+        self.firehose_live.approximate_len() + self.live_seq().approximate_len()
     }
 
     pub fn firehose_backfill_len(&self) -> Result<usize, WintermuteError> {
@@ -1776,6 +1932,72 @@ mod tests {
         let second = storage.dequeue_firehose_live_batch(10).unwrap();
         let total = first.len() + second.len();
         assert_eq!(total, 1, "job behind a stale cursor must not be skipped");
+        drop(dir);
+    }
+
+    #[test]
+    fn live_seq_generation_swap_reclaims_tombstone_debt() {
+        let dir = TempDir::with_prefix("wintermute_test_").unwrap();
+        let db_path = dir.path().join("test_db");
+        let storage = Storage::new(Some(db_path.clone())).unwrap();
+        for i in 0..500 {
+            storage
+                .enqueue_firehose_live(&live_job(&format!(
+                    "at://did:plc:a/app.bsky.feed.post/t{i}"
+                )))
+                .unwrap();
+        }
+        assert_eq!(storage.dequeue_firehose_live_batch(500).unwrap().len(), 500);
+
+        // Fully drained, but the partition still carries every job plus its
+        // tombstone as dead items.
+        let debt = storage.firehose_live_approx_len();
+        assert!(debt >= 1000, "expected >=1000 dead items, got {debt}");
+
+        assert!(storage.swap_live_seq_generation().unwrap());
+        assert_eq!(
+            storage.firehose_live_approx_len(),
+            0,
+            "swap must reclaim all tombstone debt"
+        );
+
+        // A full scan of the new generation must find nothing: drained jobs
+        // stay drained. (fjall's major_compact fails this: with no snapshots
+        // its GC watermark is 0 and compaction resurrects the drained jobs.)
+        if let Ok(mut guard) = storage.firehose_live_seq_cursor.lock() {
+            *guard = None;
+        }
+        let resurrected = storage.dequeue_firehose_live_batch(1000).unwrap();
+        assert_eq!(resurrected.len(), 0, "swap must not resurrect drained jobs");
+
+        // The queue keeps working across the swap and a reopen: the counter
+        // and cursor carry over, so new entries land above and drain in order.
+        storage
+            .enqueue_firehose_live(&live_job("at://did:plc:a/app.bsky.feed.post/after"))
+            .unwrap();
+        let resumed = storage.dequeue_firehose_live_batch(10).unwrap();
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].1.uri, "at://did:plc:a/app.bsky.feed.post/after");
+        drop(storage);
+
+        let storage = Storage::new(Some(db_path)).unwrap();
+        storage
+            .enqueue_firehose_live(&live_job("at://did:plc:a/app.bsky.feed.post/reopened"))
+            .unwrap();
+        let resumed = storage.dequeue_firehose_live_batch(10).unwrap();
+        assert_eq!(
+            resumed.len(),
+            1,
+            "the swapped generation must survive a reopen"
+        );
+        assert_eq!(
+            resumed[0].1.uri,
+            "at://did:plc:a/app.bsky.feed.post/reopened"
+        );
+
+        // A second swap flips back to the original generation name.
+        assert!(storage.swap_live_seq_generation().unwrap());
+        assert_eq!(storage.firehose_live_approx_len(), 0);
         drop(dir);
     }
 
