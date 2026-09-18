@@ -165,11 +165,24 @@ impl Storage {
 
         // Restore the seq read cursor and legacy-drained flag so a restart
         // resumes the forward scan instead of re-walking every tombstone.
-        let seq_read_cursor = cursors
+        let mut seq_read_cursor = cursors
             .get(LIVE_SEQ_READ_CURSOR.as_bytes())?
             .and_then(|v| <[u8; 8]>::try_from(v.as_ref()).ok())
             .map(|b| b.to_vec());
         let legacy_drained = cursors.get(LIVE_LEGACY_DRAINED.as_bytes())?.is_some();
+
+        // Operator escape hatch: drop the persisted read cursor so the next
+        // drain rescans the partition from the start, recovering any entries
+        // stranded below it by a pre-fix sequence-reuse deployment. One full
+        // (possibly slow) scan; unset the variable after the recovery start.
+        if std::env::var("LIVE_SEQ_CURSOR_RESET").is_ok_and(|v| v == "1" || v == "true") {
+            tracing::warn!(
+                "LIVE_SEQ_CURSOR_RESET set: dropping the live seq read cursor; \
+                 the next drain rescans firehose_live_seq from the start"
+            );
+            cursors.remove(LIVE_SEQ_READ_CURSOR.as_bytes())?;
+            seq_read_cursor = None;
+        }
 
         // Never hand out sequence keys at or below the persisted read cursor:
         // an enqueue landing there is invisible to the forward-only scan and
