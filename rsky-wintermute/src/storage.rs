@@ -120,7 +120,7 @@ impl Storage {
                 .max_memtable_size(MEMTABLE_SIZE)
                 .block_size(BLOCK_SIZE),
         )?;
-        let live_seq_start = firehose_live_seq.last_key_value()?.map_or(0, |(k, _)| {
+        let live_seq_after_last = firehose_live_seq.last_key_value()?.map_or(0, |(k, _)| {
             k.as_ref()
                 .try_into()
                 .map_or(0, |b: [u8; 8]| u64::from_be_bytes(b).saturating_add(1))
@@ -170,6 +170,17 @@ impl Storage {
             .and_then(|v| <[u8; 8]>::try_from(v.as_ref()).ok())
             .map(|b| b.to_vec());
         let legacy_drained = cursors.get(LIVE_LEGACY_DRAINED.as_bytes())?.is_some();
+
+        // Never hand out sequence keys at or below the persisted read cursor:
+        // an enqueue landing there is invisible to the forward-only scan and
+        // is stranded. last_key_value() forgets drained (deleted) keys, so
+        // after a fully-drained shutdown it would restart the counter from
+        // zero while the cursor stays high -- start above both.
+        let live_seq_after_cursor = seq_read_cursor
+            .as_deref()
+            .and_then(|v| <[u8; 8]>::try_from(v).ok())
+            .map_or(0, |b| u64::from_be_bytes(b).saturating_add(1));
+        let live_seq_start = live_seq_after_last.max(live_seq_after_cursor);
 
         Ok(Self {
             db,
@@ -443,25 +454,13 @@ impl Storage {
             self.cursors
                 .insert(LIVE_SEQ_READ_CURSOR.as_bytes(), key.as_slice())?;
             *guard = Some(key);
-        } else if results.is_empty() && poisoned.is_empty() {
-            // A wiped-and-recreated partition restarts seq keys from zero; a
-            // persisted cursor from before the wipe would then skip everything.
-            if let Some((first, _)) = self.firehose_live_seq.first_key_value()? {
-                let stale = self
-                    .firehose_live_seq_cursor
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.clone())
-                    .is_some_and(|c| first.as_ref() < c.as_slice());
-                if stale {
-                    tracing::warn!("live seq read cursor is ahead of the partition; resetting");
-                    if let Ok(mut guard) = self.firehose_live_seq_cursor.lock() {
-                        *guard = None;
-                    }
-                    self.cursors.remove(LIVE_SEQ_READ_CURSOR.as_bytes())?;
-                }
-            }
         }
+        // No staleness probe on the empty path: open_db starts the sequence
+        // counter above the persisted cursor, so no entry can ever land at or
+        // below it and an empty scan simply means the queue is drained. The
+        // old first_key_value() probe walked every tombstone in the partition
+        // on each empty poll, which wedged the drain for hours once the
+        // partition had accumulated a large backlog's tombstones.
 
         for (key, _) in &results {
             self.firehose_live_seq.remove(key.as_slice())?;
@@ -1733,12 +1732,46 @@ mod tests {
         storage
             .enqueue_firehose_live(&live_job("at://did:plc:a/app.bsky.feed.post/fresh"))
             .unwrap();
-        // Fresh key sorts below the stale cursor: first dequeue detects and
-        // resets, second dequeue returns the job.
+        // The sequence counter starts above the persisted cursor, so the
+        // fresh key lands past it and the first dequeue returns the job.
         let first = storage.dequeue_firehose_live_batch(10).unwrap();
         let second = storage.dequeue_firehose_live_batch(10).unwrap();
         let total = first.len() + second.len();
         assert_eq!(total, 1, "job behind a stale cursor must not be skipped");
+        drop(dir);
+    }
+
+    #[test]
+    fn seq_keys_are_never_reused_below_the_read_cursor() {
+        let dir = TempDir::with_prefix("wintermute_test_").unwrap();
+        let db_path = dir.path().join("test_db");
+        let storage = Storage::new(Some(db_path.clone())).unwrap();
+        for i in 0..4 {
+            storage
+                .enqueue_firehose_live(&live_job(&format!(
+                    "at://did:plc:a/app.bsky.feed.post/s{i}"
+                )))
+                .unwrap();
+        }
+        assert_eq!(storage.dequeue_firehose_live_batch(10).unwrap().len(), 4);
+        drop(storage);
+
+        // Fully drained: the partition holds only tombstones, so
+        // last_key_value() is None and a naive counter restart would hand out
+        // keys below the persisted read cursor, stranding every new enqueue
+        // where the forward-only scan never looks (seen in production as a
+        // permanently wedged live drain).
+        let storage = Storage::new(Some(db_path)).unwrap();
+        storage
+            .enqueue_firehose_live(&live_job("at://did:plc:a/app.bsky.feed.post/fresh"))
+            .unwrap();
+        let resumed = storage.dequeue_firehose_live_batch(10).unwrap();
+        assert_eq!(
+            resumed.len(),
+            1,
+            "an enqueue after a fully-drained reopen must be dequeued immediately"
+        );
+        assert_eq!(resumed[0].1.uri, "at://did:plc:a/app.bsky.feed.post/fresh");
         drop(dir);
     }
 
