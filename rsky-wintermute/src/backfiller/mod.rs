@@ -12,6 +12,7 @@ use rsky_identity::types::IdentityResolverOpts;
 use rsky_repo::parse::get_and_parse_record;
 use rsky_repo::readable_repo::ReadableRepo;
 use rsky_repo::storage::memory_blockstore::MemoryBlockstore;
+use std::future::Future;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -25,6 +26,12 @@ pub struct BackfillerManager {
     /// Where the actor generations are read before each fetch.
     generations: Option<deadpool_postgres::Pool>,
 }
+
+/// Boxed future returned by a pipeline job handler.
+type JobFuture = std::pin::Pin<Box<dyn Future<Output = Result<(), WintermuteError>> + Send>>;
+/// Job handler invoked by pipeline workers; production uses [`BackfillerManager::process_job`].
+/// Injectable so tests can reproduce worker failure modes (hangs, panics).
+type JobHandler = dyn Fn(BackfillJob) -> JobFuture + Send + Sync;
 
 /// RAII guard that decrements `BACKFILLER_REPOS_RUNNING` on drop.
 /// Prevents metric leaks when `process_job` returns early via `?`.
@@ -99,6 +106,32 @@ impl BackfillerManager {
     /// N worker tasks consume from the channel and process repos independently.
     /// No batch barriers -- each worker immediately picks up the next job when done.
     async fn process_loop(&self) {
+        let storage = Arc::clone(&self.storage);
+        let http_client = self.http_client.clone();
+        let pds_cache = Arc::clone(&self.pds_cache);
+        let generations = self.generations.clone();
+        let handler: Arc<JobHandler> = Arc::new(move |job: BackfillJob| -> JobFuture {
+            let storage = Arc::clone(&storage);
+            let http_client = http_client.clone();
+            let pds_cache = Arc::clone(&pds_cache);
+            let generations = generations.clone();
+            Box::pin(async move {
+                Self::process_job_with(
+                    &storage,
+                    &http_client,
+                    &pds_cache,
+                    &job,
+                    generations.as_ref(),
+                )
+                .await
+            })
+        });
+        self.run_pipeline(&handler).await;
+    }
+
+    /// Pipeline internals, parameterized over the per-job handler so tests can
+    /// inject failing/hanging handlers. Production behavior lives in `process_loop`.
+    async fn run_pipeline(&self, handler: &Arc<JobHandler>) {
         const MAX_EMPTY_BACKOFF_MS: u64 = 5000;
         // Channel capacity = workers * 2: enough to keep workers fed without buffering
         // thousands of dequeued items that would be lost on crash.
@@ -116,9 +149,7 @@ impl BackfillerManager {
         for worker_id in 0..self.workers {
             let rx = Arc::clone(&rx);
             let storage = Arc::clone(&self.storage);
-            let http_client = self.http_client.clone();
-            let pds_cache = Arc::clone(&self.pds_cache);
-            let generations = self.generations.clone();
+            let handler = Arc::clone(handler);
 
             worker_handles.push(tokio::spawn(async move {
                 loop {
@@ -133,15 +164,7 @@ impl BackfillerManager {
                         break;
                     };
 
-                    match Self::process_job_with(
-                        &storage,
-                        &http_client,
-                        &pds_cache,
-                        &job,
-                        generations.as_ref(),
-                    )
-                    .await
-                    {
+                    match handler(job.clone()).await {
                         Ok(()) => {}
                         Err(e) => {
                             tracing::error!("worker {worker_id}: failed {}: {e}", job.did);

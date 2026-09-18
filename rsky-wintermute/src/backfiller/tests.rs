@@ -16,6 +16,11 @@ mod backfiller_tests {
         (storage, temp_dir)
     }
 
+    /// Serializes tests that read or mutate the global `crate::SHUTDOWN` flag.
+    /// Tests run in parallel in one process, so a test flipping the flag would
+    /// otherwise tear down pipelines started by concurrently running tests.
+    static SHUTDOWN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[test]
     fn test_convert_record_preserves_objects() {
         let input = json!({"text": "hello", "nested": {"key": "value"}});
@@ -411,6 +416,7 @@ mod backfiller_tests {
     fn test_run_creates_runtime() {
         use std::sync::Arc;
 
+        let _shutdown_guard = SHUTDOWN_LOCK.blocking_lock();
         let (storage, _dir) = setup_test_storage();
         let manager = BackfillerManager::new(Arc::new(storage)).unwrap();
 
@@ -430,6 +436,7 @@ mod backfiller_tests {
     async fn test_process_loop_exits_on_shutdown() {
         use std::sync::Arc;
 
+        let _shutdown_guard = SHUTDOWN_LOCK.lock().await;
         let (storage, _dir) = setup_test_storage();
         let manager = BackfillerManager::new(Arc::new(storage)).unwrap();
 
@@ -449,6 +456,7 @@ mod backfiller_tests {
         use std::sync::Arc;
         use std::time::Duration;
 
+        let _shutdown_guard = SHUTDOWN_LOCK.lock().await;
         let (storage, _dir) = setup_test_storage();
         let manager = BackfillerManager::new(Arc::new(storage)).unwrap();
 
