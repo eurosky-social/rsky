@@ -1,16 +1,19 @@
-name: Rust CI
+name: Eurosky CI
 
-# Only runs in blacksky's repository. Forks skip every job here (the root
-# jobs are gated, so their dependents are skipped too) and carry their own
-# copy of this workflow instead; see eurosky-ci.yml for the eurosky fork.
+# The eurosky fork's copy of rust.yml. main here is a read-only mirror of
+# blacksky and eurosky is the integration branch, so this runs on pushes to
+# eurosky and on pull requests, publishes images under eurosky-social, and
+# tags eurosky (not main) as latest. Everything else is kept identical to
+# rust.yml on purpose: after merging upstream main into eurosky, diff the
+# two files and port any change to the job bodies here.
 on:
   push:
-    branches: [main]
+    branches: [eurosky]
   pull_request:
     paths:
       - '.github/scripts/determine-workspace-members.sh'
       - '.github/scripts/determine-dockerfiles.sh'
-      - '.github/workflows/rust.yml'
+      - '.github/workflows/eurosky-ci.yml'
       - 'rsky*/**'         # Matches any directory starting with "rsky"
       - 'Cargo.toml'       # Base workspace configuration
       - 'Cargo.lock'       # Dependency lock file
@@ -43,13 +46,13 @@ env:
   PDS_REPO_SIGNING_KEY_K256_PRIVATE_KEY_HEX: 71cfcf4882a6cff494c3d0affadd3858eb3a5838e7b5e15170e696a590a4fa01
   # Docker build configuration
   REGISTRY: ghcr.io
-  ORGANIZATION: blacksky-algorithms
+  ORGANIZATION: eurosky-social
 
 jobs:
   # First determine which workspace members need to be processed
   determine-workspace-members:
     runs-on: ubuntu-latest
-    if: github.repository == 'blacksky-algorithms/rsky'
+    if: github.repository == 'eurosky-social/rsky'
     outputs:
       workspace_members: ${{ steps.set-members.outputs.workspace_members }}
     steps:
@@ -73,7 +76,7 @@ jobs:
   # Determine which Dockerfiles need to be processed
   determine-dockerfiles:
     runs-on: ubuntu-latest
-    if: github.repository == 'blacksky-algorithms/rsky'
+    if: github.repository == 'eurosky-social/rsky'
     outputs:
       dockerfiles: ${{ steps.set-dockerfiles.outputs.dockerfiles }}
       is_fork: ${{ steps.set-dockerfiles.outputs.is_fork }}
@@ -248,7 +251,7 @@ jobs:
   # Run formatting check on the entire workspace
   formatting:
     runs-on: ubuntu-latest
-    if: github.repository == 'blacksky-algorithms/rsky'
+    if: github.repository == 'eurosky-social/rsky'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -310,11 +313,11 @@ jobs:
           tags: |
             # Always add the git commit SHA
             type=sha,format=long
-            # Add 'main' tag if this is on the main branch
-            type=raw,value=main,enable=${{ github.ref == 'refs/heads/main' }}
-            # On main, also tag the crate version and 'latest'
-            type=raw,value=${{ steps.crate.outputs.version }},enable=${{ github.ref == 'refs/heads/main' && steps.crate.outputs.version != '' }}
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            # Add 'eurosky' tag if this is on the eurosky branch
+            type=raw,value=eurosky,enable=${{ github.ref == 'refs/heads/eurosky' }}
+            # On eurosky, also tag the crate version and 'latest'
+            type=raw,value=${{ steps.crate.outputs.version }},enable=${{ github.ref == 'refs/heads/eurosky' && steps.crate.outputs.version != '' }}
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/eurosky' }}
       
       # Build the Docker image (no push if from fork)
       - name: Build Docker image
@@ -367,7 +370,7 @@ jobs:
   ci-success:
     runs-on: ubuntu-latest
     needs: [check, build-and-test, coverage-pds, formatting, determine-dockerfiles]
-    if: always() && github.repository == 'blacksky-algorithms/rsky'
+    if: always() && github.repository == 'eurosky-social/rsky'
     steps:
       - name: Check if docker-build should run
         id: should-docker-build

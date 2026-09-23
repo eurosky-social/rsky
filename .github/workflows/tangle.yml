@@ -10,6 +10,8 @@ permissions:
 jobs:
   tangle:
     runs-on: ubuntu-latest
+    # Forks have no TANGLED_KEY and nothing to mirror.
+    if: github.repository == 'blacksky-algorithms/rsky'
     steps:
       - uses: actions/checkout@v4
         with:
