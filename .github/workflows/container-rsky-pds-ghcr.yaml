@@ -2,17 +2,15 @@ name: container-rsky-pds-ghcr
 on:
   push:
     branches:
-      - main
+      - eurosky
     paths:
-      - 'rsky-pds/**'
-      - 'rsky-common/**'
-      - 'rsky-crypto/**'
-      - 'rsky-identity/**'
-      - 'rsky-lexicon/**'
-      - 'rsky-repo/**'
-      - 'rsky-syntax/**'
+      # rsky-pds/Dockerfile copies the whole workspace, so any crate can
+      # change what ends up in the image.
+      - 'rsky*/**'
+      - 'vendor/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
+      - 'rust-toolchain'
       - '.github/workflows/container-rsky-pds-ghcr.yaml'
 
 env:
@@ -22,11 +20,13 @@ env:
 
   # github.repository as <account>/<repo>
   IMAGE_NAME: ${{ github.repository }}
-  BRANCH: ${{ github.ref_name != 'main' && github.ref_name || '' }}
+  # eurosky is this fork's integration branch, so its images carry no branch prefix.
+  BRANCH: ${{ github.ref_name != 'eurosky' && github.ref_name || '' }}
 
 jobs:
   build-platforms:
     runs-on: ${{ matrix.runner }}
+    if: github.repository == 'eurosky-social/rsky'
     timeout-minutes: 60
     permissions:
       contents: read
