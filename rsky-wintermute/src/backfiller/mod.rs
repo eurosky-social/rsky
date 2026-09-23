@@ -1,10 +1,11 @@
 mod tests;
 
 use crate::SHUTDOWN;
-use crate::config::{WORKERS_BACKFILLER, backfiller_timeout};
+use crate::config::{WORKERS_BACKFILLER, backfiller_job_timeout, backfiller_timeout};
 use crate::storage::Storage;
 use crate::types::{BackfillJob, IndexJob, WintermuteError, WriteAction};
 use dashmap::DashMap;
+use futures::FutureExt;
 use iroh_car::CarReader;
 use rsky_identity::IdResolver;
 use rsky_identity::safe_fetch::{Redirects, SafeClient};
@@ -12,6 +13,7 @@ use rsky_identity::types::IdentityResolverOpts;
 use rsky_repo::parse::get_and_parse_record;
 use rsky_repo::readable_repo::ReadableRepo;
 use rsky_repo::storage::memory_blockstore::MemoryBlockstore;
+use std::future::Future;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
@@ -24,7 +26,17 @@ pub struct BackfillerManager {
     pds_cache: Arc<DashMap<String, String>>,
     /// Where the actor generations are read before each fetch.
     generations: Option<deadpool_postgres::Pool>,
+    /// Upper bound on one whole job (resolve + fetch + parse + enqueue).
+    /// A job exceeding it is failed into the retry/dead-letter path instead
+    /// of occupying its worker forever.
+    job_timeout: Duration,
 }
+
+/// Boxed future returned by a pipeline job handler.
+type JobFuture = std::pin::Pin<Box<dyn Future<Output = Result<(), WintermuteError>> + Send>>;
+/// Job handler invoked by pipeline workers; production uses [`BackfillerManager::process_job`].
+/// Injectable so tests can reproduce worker failure modes (hangs, panics).
+type JobHandler = dyn Fn(BackfillJob) -> JobFuture + Send + Sync;
 
 /// RAII guard that decrements `BACKFILLER_REPOS_RUNNING` on drop.
 /// Prevents metric leaks when `process_job` returns early via `?`.
@@ -49,10 +61,11 @@ impl BackfillerManager {
         let http_client = crate::outbound::client()?;
 
         tracing::info!(
-            "backfiller config: workers={}, channel_cap={}, timeout={:?}",
+            "backfiller config: workers={}, channel_cap={}, fetch_timeout={:?}, job_timeout={:?}",
             workers,
             workers * 2,
-            backfiller_timeout()
+            backfiller_timeout(),
+            backfiller_job_timeout()
         );
 
         Ok(Self {
@@ -61,6 +74,7 @@ impl BackfillerManager {
             http_client,
             generations: None,
             pds_cache: Arc::new(DashMap::new()),
+            job_timeout: backfiller_job_timeout(),
         })
     }
 
@@ -99,6 +113,32 @@ impl BackfillerManager {
     /// N worker tasks consume from the channel and process repos independently.
     /// No batch barriers -- each worker immediately picks up the next job when done.
     async fn process_loop(&self) {
+        let storage = Arc::clone(&self.storage);
+        let http_client = self.http_client.clone();
+        let pds_cache = Arc::clone(&self.pds_cache);
+        let generations = self.generations.clone();
+        let handler: Arc<JobHandler> = Arc::new(move |job: BackfillJob| -> JobFuture {
+            let storage = Arc::clone(&storage);
+            let http_client = http_client.clone();
+            let pds_cache = Arc::clone(&pds_cache);
+            let generations = generations.clone();
+            Box::pin(async move {
+                Self::process_job_with(
+                    &storage,
+                    &http_client,
+                    &pds_cache,
+                    &job,
+                    generations.as_ref(),
+                )
+                .await
+            })
+        });
+        self.run_pipeline(&handler).await;
+    }
+
+    /// Pipeline internals, parameterized over the per-job handler so tests can
+    /// inject failing/hanging handlers. Production behavior lives in `process_loop`.
+    async fn run_pipeline(&self, handler: &Arc<JobHandler>) {
         const MAX_EMPTY_BACKOFF_MS: u64 = 5000;
         // Channel capacity = workers * 2: enough to keep workers fed without buffering
         // thousands of dequeued items that would be lost on crash.
@@ -112,13 +152,12 @@ impl BackfillerManager {
         );
 
         // Spawn worker tasks -- each loops forever, pulling from the channel
+        let job_timeout = self.job_timeout;
         let mut worker_handles = Vec::with_capacity(self.workers);
         for worker_id in 0..self.workers {
             let rx = Arc::clone(&rx);
             let storage = Arc::clone(&self.storage);
-            let http_client = self.http_client.clone();
-            let pds_cache = Arc::clone(&self.pds_cache);
-            let generations = self.generations.clone();
+            let handler = Arc::clone(handler);
 
             worker_handles.push(tokio::spawn(async move {
                 loop {
@@ -133,15 +172,30 @@ impl BackfillerManager {
                         break;
                     };
 
-                    match Self::process_job_with(
-                        &storage,
-                        &http_client,
-                        &pds_cache,
-                        &job,
-                        generations.as_ref(),
+                    // Bound the whole job and contain panics: a wedged
+                    // upstream or a poison repo must fail this job (into the
+                    // retry/dead-letter path below) instead of occupying the
+                    // worker forever or killing it.
+                    let attempt = tokio::time::timeout(
+                        job_timeout,
+                        std::panic::AssertUnwindSafe(handler(job.clone())).catch_unwind(),
                     )
-                    .await
-                    {
+                    .await;
+                    let result = match attempt {
+                        Ok(Ok(result)) => result,
+                        Ok(Err(panic)) => {
+                            let msg = panic
+                                .downcast_ref::<&str>()
+                                .map(|s| (*s).to_owned())
+                                .or_else(|| panic.downcast_ref::<String>().cloned())
+                                .unwrap_or_else(|| "unknown panic payload".to_owned());
+                            Err(WintermuteError::Other(format!("job panicked: {msg}")))
+                        }
+                        Err(_elapsed) => Err(WintermuteError::Other(format!(
+                            "job timed out after {job_timeout:?}"
+                        ))),
+                    };
+                    match result {
                         Ok(()) => {}
                         Err(e) => {
                             tracing::error!("worker {worker_id}: failed {}: {e}", job.did);

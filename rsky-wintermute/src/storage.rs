@@ -1,46 +1,279 @@
-use crate::config::{BLOCK_SIZE, CACHE_SIZE, FSYNC_MS, MEMTABLE_SIZE, WRITE_BUFFER_SIZE};
+//! Durable on-disk queues and small key-value state for wintermute.
+//!
+//! Every queue here is written once and read once in order, so each one is
+//! a segmented append-only log (see [`crate::queue_log`]) rather than a
+//! sorted map: no tombstones, no compaction, dequeue cost independent of how
+//! much has been drained. The public API is unchanged from the Fjall/LMDB
+//! implementation it replaces, including the partitioned backfill dequeue.
+//!
+//! Layout under the storage directory:
+//!
+//! ```text
+//! firehose_live/                 FIFO log of live IndexJobs
+//! label_live/                    FIFO log of LabelEvents
+//! repo_backfill/{immediate,priority,normal}/
+//!                                three FIFO logs drained in that order
+//! repo_backfill/cancelled.cbor   DIDs removed by operators, with counts
+//! firehose_backfill/priority/    FIFO log all indexer workers drain first
+//! firehose_backfill/shard_NNN/   240 FIFO logs, sliced across workers
+//! cursors.cbor                   name -> i64 map, rewritten atomically
+//! firehose_events/<seq>.cbor     one file per event (no production caller)
+//! ```
 
-const LIVE_SEQ_READ_CURSOR: &str = "live_seq_read";
-const LIVE_LEGACY_DRAINED: &str = "live_legacy_drained";
-use crate::types::{BackfillJob, FirehoseEvent, IndexJob, WintermuteError};
-use fjall::{Config, Keyspace, PartitionCreateOptions, PartitionHandle};
-use heed::types::Bytes;
-use heed::{Database as HeedDatabase, Env, EnvOpenOptions};
-use std::ops::Bound;
-use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use crate::config::{QUEUE_LOG_FSYNC_MS, QUEUE_LOG_SEGMENT_BYTES};
+use crate::queue_log::SegmentedLog;
+use crate::types::{BackfillJob, FirehoseEvent, IndexJob, LabelEvent, WintermuteError};
+use std::collections::HashMap;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::time::Duration;
 
-/// LMDB max map size: 4TB for `firehose_backfill` queue.
-/// Tests use 1GB: repeated 4TB reservations exhaust macOS address space.
-const LMDB_MAP_SIZE: usize = if cfg!(test) {
-    1024 * 1024 * 1024
-} else {
-    4 * 1024 * 1024 * 1024 * 1024
-};
+/// Normal-priority `firehose_backfill` jobs are spread over this many shard
+/// logs; a worker owns a contiguous slice of them. Matches the 240 random
+/// key prefixes (0x10..=0xff) of the previous key-space partitioning, so the
+/// worker-to-slice arithmetic is identical.
+const BACKFILL_SHARDS: usize = 240;
+
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn open_log(dir: PathBuf) -> Result<SegmentedLog, WintermuteError> {
+    Ok(SegmentedLog::open(
+        dir,
+        QUEUE_LOG_SEGMENT_BYTES,
+        Duration::from_millis(QUEUE_LOG_FSYNC_MS),
+    )?)
+}
+
+fn encode<T: serde::Serialize>(value: &T) -> Result<Vec<u8>, WintermuteError> {
+    let mut out = Vec::new();
+    ciborium::into_writer(value, &mut out)
+        .map_err(|e| WintermuteError::Serialization(format!("failed to serialize: {e}")))?;
+    Ok(out)
+}
+
+fn decode<T: serde::de::DeserializeOwned>(bytes: &[u8]) -> Result<T, WintermuteError> {
+    ciborium::from_reader(bytes)
+        .map_err(|e| WintermuteError::Serialization(format!("failed to deserialize: {e}")))
+}
+
+/// Writes `bytes` to `path` through a temporary file and a rename, so a
+/// crash leaves either the old or the new contents, never a mix.
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, path)
+}
+
+/// Small name -> value map persisted as one CBOR file.
+struct CursorFile {
+    path: PathBuf,
+    map: Mutex<HashMap<String, i64>>,
+}
+
+impl CursorFile {
+    fn open(path: PathBuf) -> Result<Self, WintermuteError> {
+        let map = match std::fs::read(&path) {
+            Ok(bytes) => decode(&bytes)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => HashMap::new(),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(Self {
+            path,
+            map: Mutex::new(map),
+        })
+    }
+
+    fn get(&self, name: &str) -> Option<i64> {
+        lock(&self.map).get(name).copied()
+    }
+
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "held across the write so concurrent updates reach disk in memory order"
+    )]
+    fn update(&self, f: impl FnOnce(&mut HashMap<String, i64>)) -> Result<(), WintermuteError> {
+        let mut map = lock(&self.map);
+        f(&mut map);
+        let bytes = encode(&*map)?;
+        write_atomic(&self.path, &bytes)?;
+        Ok(())
+    }
+}
+
+type BackfillBatch = Vec<(Vec<u8>, BackfillJob)>;
+
+/// The `repo_backfill` queue: three priority levels, each its own log, plus
+/// a map of DIDs an operator asked to remove. A log cannot delete from the
+/// middle, so removal is recorded and applied when the job reaches the head.
+struct RepoBackfillQueue {
+    immediate: SegmentedLog,
+    priority: SegmentedLog,
+    normal: SegmentedLog,
+    cancelled_path: PathBuf,
+    cancelled: Mutex<HashMap<String, usize>>,
+}
+
+impl RepoBackfillQueue {
+    fn open(dir: &Path) -> Result<Self, WintermuteError> {
+        let cancelled_path = dir.join("cancelled.cbor");
+        let cancelled = match std::fs::read(&cancelled_path) {
+            Ok(bytes) => decode(&bytes)?,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => HashMap::new(),
+            Err(e) => return Err(e.into()),
+        };
+        Ok(Self {
+            immediate: open_log(dir.join("immediate"))?,
+            priority: open_log(dir.join("priority"))?,
+            normal: open_log(dir.join("normal"))?,
+            cancelled_path,
+            cancelled: Mutex::new(cancelled),
+        })
+    }
+
+    const fn logs(&self) -> [&SegmentedLog; 3] {
+        [&self.immediate, &self.priority, &self.normal]
+    }
+
+    fn len(&self) -> usize {
+        let queued: usize = self.logs().iter().map(|l| l.len()).sum();
+        let cancelled: usize = lock(&self.cancelled).values().sum();
+        queued.saturating_sub(cancelled)
+    }
+
+    fn persist_cancelled(&self, map: &HashMap<String, usize>) -> Result<(), WintermuteError> {
+        write_atomic(&self.cancelled_path, &encode(map)?)?;
+        Ok(())
+    }
+
+    /// Consumes up to `count` jobs across the three levels, dropping any
+    /// that an operator cancelled. Returns the jobs and how many were
+    /// dropped (so the caller can settle the queue gauge).
+    fn dequeue(&self, count: usize) -> Result<(BackfillBatch, usize), WintermuteError> {
+        let mut out = Vec::with_capacity(count);
+        let mut dropped = 0usize;
+        for (level, log) in self.logs().into_iter().enumerate() {
+            while out.len() < count {
+                let batch = log.read_batch(count - out.len())?;
+                if batch.is_empty() {
+                    break;
+                }
+                let mut cancelled = lock(&self.cancelled);
+                let mut changed = false;
+                for (key, bytes) in batch {
+                    let job: BackfillJob = match decode(&bytes) {
+                        Ok(job) => job,
+                        Err(e) => {
+                            tracing::error!("dropping undeserializable repo_backfill entry: {e}");
+                            dropped += 1;
+                            continue;
+                        }
+                    };
+                    if let Some(remaining) = cancelled.get_mut(&job.did) {
+                        *remaining -= 1;
+                        if *remaining == 0 {
+                            cancelled.remove(&job.did);
+                        }
+                        changed = true;
+                        dropped += 1;
+                        continue;
+                    }
+                    let mut full_key = Vec::with_capacity(1 + key.len());
+                    #[allow(clippy::cast_possible_truncation)]
+                    full_key.push(level as u8);
+                    full_key.extend_from_slice(&key);
+                    out.push((full_key, job));
+                }
+                if changed {
+                    self.persist_cancelled(&cancelled)?;
+                }
+                drop(cancelled);
+            }
+        }
+        Ok((out, dropped))
+    }
+
+    /// Reads up to `limit` jobs in dequeue order without consuming them.
+    fn peek(&self, limit: usize) -> Result<BackfillBatch, WintermuteError> {
+        let mut out = Vec::with_capacity(limit.min(4096));
+        let mut cancelled = lock(&self.cancelled).clone();
+        for (level, log) in self.logs().into_iter().enumerate() {
+            if out.len() >= limit {
+                break;
+            }
+            // Cancelled jobs are still physically queued, so over-read to
+            // fill the limit after filtering them out.
+            let extra: usize = cancelled.values().sum();
+            for (key, bytes) in log.peek(limit - out.len() + extra)? {
+                if out.len() >= limit {
+                    break;
+                }
+                let job: BackfillJob = match decode(&bytes) {
+                    Ok(job) => job,
+                    Err(_) => continue,
+                };
+                if let Some(remaining) = cancelled.get_mut(&job.did) {
+                    *remaining -= 1;
+                    if *remaining == 0 {
+                        cancelled.remove(&job.did);
+                    }
+                    continue;
+                }
+                let mut full_key = Vec::with_capacity(1 + key.len());
+                #[allow(clippy::cast_possible_truncation)]
+                full_key.push(level as u8);
+                full_key.extend_from_slice(&key);
+                out.push((full_key, job));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Marks every queued job for `did` as removed. Returns how many.
+    fn remove_by_did(&self, did: &str) -> Result<usize, WintermuteError> {
+        let mut found = 0usize;
+        for log in self.logs() {
+            log.for_each_unread(|bytes| {
+                if decode::<BackfillJob>(bytes).is_ok_and(|job| job.did == did) {
+                    found += 1;
+                }
+            })?;
+        }
+        let mut cancelled = lock(&self.cancelled);
+        let already = cancelled.get(did).copied().unwrap_or(0);
+        let newly = found.saturating_sub(already);
+        if newly > 0 {
+            cancelled.insert(did.to_owned(), found);
+            self.persist_cancelled(&cancelled)?;
+        }
+        drop(cancelled);
+        Ok(newly)
+    }
+
+    /// Drops every queued job. Returns how many were live (not cancelled).
+    fn clear(&self) -> Result<usize, WintermuteError> {
+        let live = self.len();
+        for log in self.logs() {
+            while !log.read_batch(4096)?.is_empty() {}
+        }
+        let mut cancelled = lock(&self.cancelled);
+        cancelled.clear();
+        self.persist_cancelled(&cancelled)?;
+        drop(cancelled);
+        Ok(live)
+    }
+}
 
 pub struct Storage {
-    #[allow(dead_code)] // Kept for Fjall keyspace - partitions reference it internally
-    db: Arc<Keyspace>,
-    firehose_events: PartitionHandle,
-    repo_backfill: PartitionHandle,
-    firehose_live: PartitionHandle,
-    // Sequence-keyed successor to `firehose_live`: monotonic u64 keys mean the
-    // read cursor only moves forward and dequeue tombstones are never
-    // re-scanned. The legacy uri-keyed partition drains first, then this one.
-    firehose_live_seq: PartitionHandle,
-    label_live: PartitionHandle,
-    cursors: PartitionHandle,
-    // LMDB for firehose_backfill - eliminates L0 compaction stalls
-    lmdb_env: Env,
-    firehose_backfill_db: HeedDatabase<Bytes, Bytes>,
-    // Sweep cursor: keys are uri-first, so intake interleaves with the dequeue
-    // head and tombstones pile up there; scanning from the last dequeued key
-    // (wrapping when exhausted) avoids re-walking them every batch.
-    firehose_live_cursor: std::sync::Mutex<Option<Vec<u8>>>,
-    firehose_live_seq_cursor: std::sync::Mutex<Option<Vec<u8>>>,
-    live_seq_next: AtomicU64,
-    legacy_live_drained: AtomicBool,
+    firehose_events_dir: PathBuf,
+    repo_backfill: RepoBackfillQueue,
+    firehose_live: SegmentedLog,
+    label_live: SegmentedLog,
+    firehose_backfill_priority: SegmentedLog,
+    firehose_backfill_shards: Vec<SegmentedLog>,
+    cursors: CursorFile,
     live_notify: tokio::sync::Notify,
 }
 
@@ -48,7 +281,6 @@ impl Storage {
     pub fn new(db_path: Option<PathBuf>) -> Result<Self, WintermuteError> {
         let path = db_path.unwrap_or_else(|| "backfill_cache".into());
 
-        // Try to open, recover from corruption if needed
         match Self::open_db(&path) {
             Ok(storage) => Ok(storage),
             Err(e) if e.is_storage_corrupted() => {
@@ -57,136 +289,49 @@ impl Storage {
                     path.display()
                 );
                 crate::metrics::STORAGE_RECOVERY_TOTAL.inc();
-
-                // Delete corrupted database
                 if let Err(rm_err) = std::fs::remove_dir_all(&path) {
                     tracing::warn!("failed to remove corrupted db directory: {rm_err}");
                 }
-
-                // Retry opening (will create fresh)
                 Self::open_db(&path)
             }
             Err(e) => Err(e),
         }
     }
 
-    fn open_db(path: &PathBuf) -> Result<Self, WintermuteError> {
+    fn open_db(path: &Path) -> Result<Self, WintermuteError> {
+        std::fs::create_dir_all(path)?;
         tracing::info!(
-            "opening Fjall with cache={}GB, write_buffer={}GB, memtable={}MB",
-            *CACHE_SIZE / (1024 * 1024 * 1024),
-            *WRITE_BUFFER_SIZE / (1024 * 1024 * 1024),
-            MEMTABLE_SIZE / (1024 * 1024)
-        );
-        let db = Config::new(path)
-            .cache_size(*CACHE_SIZE)
-            .max_write_buffer_size(*WRITE_BUFFER_SIZE)
-            .fsync_ms(FSYNC_MS)
-            .open()
-            .map_err(|e| {
-                let err: WintermuteError = e.into();
-                if err.is_storage_corrupted() {
-                    err
-                } else {
-                    WintermuteError::Other(format!("failed to open database: {err}"))
-                }
-            })?;
-
-        let db = Arc::new(db);
-
-        let firehose_events = db.open_partition(
-            "firehose_events",
-            PartitionCreateOptions::default()
-                .max_memtable_size(MEMTABLE_SIZE)
-                .block_size(BLOCK_SIZE),
-        )?;
-
-        let repo_backfill = db.open_partition(
-            "repo_backfill",
-            PartitionCreateOptions::default()
-                .max_memtable_size(MEMTABLE_SIZE)
-                .block_size(BLOCK_SIZE),
-        )?;
-
-        let firehose_live = db.open_partition(
-            "firehose_live",
-            PartitionCreateOptions::default()
-                .max_memtable_size(MEMTABLE_SIZE)
-                .block_size(BLOCK_SIZE),
-        )?;
-
-        let firehose_live_seq = db.open_partition(
-            "firehose_live_seq",
-            PartitionCreateOptions::default()
-                .max_memtable_size(MEMTABLE_SIZE)
-                .block_size(BLOCK_SIZE),
-        )?;
-        let live_seq_start = firehose_live_seq.last_key_value()?.map_or(0, |(k, _)| {
-            k.as_ref()
-                .try_into()
-                .map_or(0, |b: [u8; 8]| u64::from_be_bytes(b).saturating_add(1))
-        });
-
-        let label_live = db.open_partition(
-            "label_live",
-            PartitionCreateOptions::default()
-                .max_memtable_size(MEMTABLE_SIZE)
-                .block_size(BLOCK_SIZE),
-        )?;
-
-        let cursors = db.open_partition("cursors", PartitionCreateOptions::default())?;
-
-        // Open LMDB for firehose_backfill - B+ tree eliminates LSM compaction stalls
-        let lmdb_path = path.join("firehose_backfill_lmdb");
-        std::fs::create_dir_all(&lmdb_path)
-            .map_err(|e| WintermuteError::Other(format!("failed to create LMDB directory: {e}")))?;
-
-        tracing::info!(
-            "opening LMDB for firehose_backfill at {} with map_size={}GB",
-            lmdb_path.display(),
-            LMDB_MAP_SIZE / (1024 * 1024 * 1024)
+            "opening queue logs at {} (segment={}MB, fsync={}ms, backfill shards={})",
+            path.display(),
+            QUEUE_LOG_SEGMENT_BYTES / (1024 * 1024),
+            QUEUE_LOG_FSYNC_MS,
+            BACKFILL_SHARDS
         );
 
-        let lmdb_env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(LMDB_MAP_SIZE)
-                .max_dbs(1)
-                .open(&lmdb_path)
-                .map_err(|e| WintermuteError::Other(format!("failed to open LMDB: {e}")))?
-        };
+        let firehose_events_dir = path.join("firehose_events");
+        std::fs::create_dir_all(&firehose_events_dir)?;
 
-        let mut wtxn = lmdb_env
-            .write_txn()
-            .map_err(|e| WintermuteError::Other(format!("LMDB write txn failed: {e}")))?;
-        let firehose_backfill_db: HeedDatabase<Bytes, Bytes> = lmdb_env
-            .create_database(&mut wtxn, Some("firehose_backfill"))
-            .map_err(|e| WintermuteError::Other(format!("LMDB create database failed: {e}")))?;
-        wtxn.commit()
-            .map_err(|e| WintermuteError::Other(format!("LMDB commit failed: {e}")))?;
-
-        // Restore the seq read cursor and legacy-drained flag so a restart
-        // resumes the forward scan instead of re-walking every tombstone.
-        let seq_read_cursor = cursors
-            .get(LIVE_SEQ_READ_CURSOR.as_bytes())?
-            .and_then(|v| <[u8; 8]>::try_from(v.as_ref()).ok())
-            .map(|b| b.to_vec());
-        let legacy_drained = cursors.get(LIVE_LEGACY_DRAINED.as_bytes())?.is_some();
+        let backfill_dir = path.join("firehose_backfill");
+        let firehose_backfill_shards = (0..BACKFILL_SHARDS)
+            .map(|i| open_log(backfill_dir.join(format!("shard_{i:03}"))))
+            .collect::<Result<Vec<_>, _>>()?;
 
         Ok(Self {
-            db,
-            firehose_events,
-            repo_backfill,
-            firehose_live,
-            firehose_live_seq,
-            label_live,
-            cursors,
-            lmdb_env,
-            firehose_backfill_db,
-            firehose_live_cursor: std::sync::Mutex::new(None),
-            firehose_live_seq_cursor: std::sync::Mutex::new(seq_read_cursor),
-            live_seq_next: AtomicU64::new(live_seq_start),
-            legacy_live_drained: AtomicBool::new(legacy_drained),
+            firehose_events_dir,
+            repo_backfill: RepoBackfillQueue::open(&path.join("repo_backfill"))?,
+            firehose_live: open_log(path.join("firehose_live"))?,
+            label_live: open_log(path.join("label_live"))?,
+            firehose_backfill_priority: open_log(backfill_dir.join("priority"))?,
+            firehose_backfill_shards,
+            cursors: CursorFile::open(path.join("cursors.cbor"))?,
             live_notify: tokio::sync::Notify::new(),
         })
+    }
+
+    // ---- firehose_events ---------------------------------------------------
+
+    fn event_path(&self, seq: i64) -> PathBuf {
+        self.firehose_events_dir.join(format!("{seq}.cbor"))
     }
 
     pub fn write_firehose_event(
@@ -194,116 +339,63 @@ impl Storage {
         seq: i64,
         event: &FirehoseEvent,
     ) -> Result<(), WintermuteError> {
-        let key = seq.to_be_bytes();
-        let mut value = Vec::new();
-        ciborium::into_writer(event, &mut value).map_err(|e| {
-            WintermuteError::Serialization(format!("failed to serialize event: {e}"))
-        })?;
-        self.firehose_events.insert(key, value.as_slice())?;
+        write_atomic(&self.event_path(seq), &encode(event)?)?;
         Ok(())
     }
 
     pub fn read_firehose_event(&self, seq: i64) -> Result<Option<FirehoseEvent>, WintermuteError> {
-        let key = seq.to_be_bytes();
-        let Some(value) = self.firehose_events.get(key)? else {
-            return Ok(None);
-        };
-        let event = ciborium::from_reader(value.as_ref())
-            .map_err(|e| WintermuteError::Serialization(format!("failed to deserialize: {e}")))?;
-        Ok(Some(event))
+        match std::fs::read(self.event_path(seq)) {
+            Ok(bytes) => Ok(Some(decode(&bytes)?)),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
     }
 
-    /// Enqueue a backfill job with normal priority (prefix "1:")
-    /// Normal priority items are processed after all priority items
+    // ---- repo_backfill -----------------------------------------------------
+
+    /// Enqueue a backfill job with normal priority.
+    /// Normal priority items are processed after all priority items.
     pub fn enqueue_backfill(&self, job: &BackfillJob) -> Result<(), WintermuteError> {
-        // Key format: "1:{timestamp}:{did}" - "1:" prefix for normal priority
-        // Timestamp first ensures FIFO ordering within priority level
-        let key = format!(
-            "1:{}:{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-            job.did
-        );
-        let mut value = Vec::new();
-        ciborium::into_writer(job, &mut value)
-            .map_err(|e| WintermuteError::Serialization(format!("failed to serialize job: {e}")))?;
-        self.repo_backfill
-            .insert(key.as_bytes(), value.as_slice())?;
+        self.repo_backfill.normal.append(&encode(job)?)?;
         crate::metrics::INGESTER_REPO_BACKFILL_LENGTH.inc();
         Ok(())
     }
 
-    /// Enqueue a backfill job with HIGH priority (prefix "0:")
-    /// Priority items are processed BEFORE all normal items
-    /// Use this for manual/on-demand backfill requests
+    /// Enqueue a backfill job with HIGH priority.
+    /// Priority items are processed BEFORE all normal items.
+    /// Use this for manual/on-demand backfill requests.
     pub fn enqueue_backfill_priority(&self, job: &BackfillJob) -> Result<(), WintermuteError> {
-        // Key format: "0:{timestamp}:{did}" - "0:" prefix for high priority
-        // Timestamp ensures FIFO ordering within priority level
-        let key = format!(
-            "0:{}:{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-            job.did
-        );
-        let mut value = Vec::new();
-        ciborium::into_writer(job, &mut value)
-            .map_err(|e| WintermuteError::Serialization(format!("failed to serialize job: {e}")))?;
-        self.repo_backfill
-            .insert(key.as_bytes(), value.as_slice())?;
+        self.repo_backfill.priority.append(&encode(job)?)?;
         crate::metrics::INGESTER_REPO_BACKFILL_LENGTH.inc();
         Ok(())
     }
 
-    /// Enqueue a backfill job with IMMEDIATE priority (timestamp 0)
-    /// These items are processed FIRST, before all other priority items
+    /// Enqueue a backfill job with IMMEDIATE priority.
+    /// These items are processed FIRST, before all other priority items.
     pub fn enqueue_backfill_immediate(&self, job: &BackfillJob) -> Result<(), WintermuteError> {
-        // Key format: "0:0:{did}" - timestamp 0 ensures it sorts first
-        let key = format!("0:0:{}", job.did);
-        let mut value = Vec::new();
-        ciborium::into_writer(job, &mut value)
-            .map_err(|e| WintermuteError::Serialization(format!("failed to serialize job: {e}")))?;
-        self.repo_backfill
-            .insert(key.as_bytes(), value.as_slice())?;
+        self.repo_backfill.immediate.append(&encode(job)?)?;
         crate::metrics::INGESTER_REPO_BACKFILL_LENGTH.inc();
         Ok(())
     }
 
     pub fn dequeue_backfill(&self) -> Result<Option<(Vec<u8>, BackfillJob)>, WintermuteError> {
-        let mut iter = self.repo_backfill.iter();
-        let Some(entry) = iter.next() else {
-            return Ok(None);
-        };
-        let (key, value) = entry?;
-        let key_vec = key.to_vec();
-        let job = ciborium::from_reader(value.as_ref())
-            .map_err(|e| WintermuteError::Serialization(format!("failed to deserialize: {e}")))?;
-        // Remove immediately to prevent re-dequeue race condition
-        self.repo_backfill.remove(&key_vec)?;
-        crate::metrics::INGESTER_REPO_BACKFILL_LENGTH.dec();
-        Ok(Some((key_vec, job)))
+        let mut batch = self.dequeue_backfill_batch(1)?;
+        if batch.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(batch.remove(0)))
+        }
     }
 
-    /// Bulk dequeue using a single Fjall iterator instead of creating one per item.
-    /// With 24M+ items in the LSM tree, each `iter()` construction requires merging
-    /// across all segments. This was consuming 77% of backfiller CPU.
+    /// Dequeue up to `count` jobs: immediate, then priority, then normal,
+    /// each in arrival order.
     pub fn dequeue_backfill_batch(
         &self,
         count: usize,
     ) -> Result<Vec<(Vec<u8>, BackfillJob)>, WintermuteError> {
-        let mut jobs = Vec::with_capacity(count);
-        let iter = self.repo_backfill.iter();
-        for entry in iter.take(count) {
-            let (key, value) = entry?;
-            let key_vec = key.to_vec();
-            let job: BackfillJob = ciborium::from_reader(value.as_ref()).map_err(|e| {
-                WintermuteError::Serialization(format!("failed to deserialize: {e}"))
-            })?;
-            jobs.push((key_vec, job));
-        }
-        // Remove all dequeued items
-        for (key, _) in &jobs {
-            self.repo_backfill.remove(key)?;
-        }
+        let (jobs, dropped) = self.repo_backfill.dequeue(count)?;
         #[allow(clippy::cast_possible_wrap)]
-        crate::metrics::INGESTER_REPO_BACKFILL_LENGTH.sub(jobs.len() as i64);
+        crate::metrics::INGESTER_REPO_BACKFILL_LENGTH.sub((jobs.len() + dropped) as i64);
         Ok(jobs)
     }
 
@@ -313,15 +405,12 @@ impl Storage {
         Ok(())
     }
 
-    // Firehose live queue (from ingester); keys are monotonic so dequeue order
-    // is arrival order and the read cursor never revisits tombstones.
+    // ---- firehose_live -----------------------------------------------------
+
+    /// Enqueue a live index job. Keys are log positions, so dequeue order is
+    /// arrival order.
     pub fn enqueue_firehose_live(&self, job: &IndexJob) -> Result<(), WintermuteError> {
-        let seq = self.live_seq_next.fetch_add(1, Ordering::Relaxed);
-        let mut value = Vec::new();
-        ciborium::into_writer(job, &mut value)
-            .map_err(|e| WintermuteError::Serialization(format!("failed to serialize job: {e}")))?;
-        self.firehose_live_seq
-            .insert(seq.to_be_bytes(), value.as_slice())?;
+        self.firehose_live.append(&encode(job)?)?;
         crate::metrics::INGESTER_FIREHOSE_LIVE_LENGTH.inc();
         self.live_notify.notify_one();
         Ok(())
@@ -329,7 +418,7 @@ impl Storage {
 
     /// Block until an enqueue signals the live queue, or `timeout` elapses.
     /// A permit stored by a `notify_one` that raced ahead completes immediately.
-    pub async fn wait_for_live_enqueue(&self, timeout: std::time::Duration) {
+    pub async fn wait_for_live_enqueue(&self, timeout: Duration) {
         drop(tokio::time::timeout(timeout, self.live_notify.notified()).await);
     }
 
@@ -348,587 +437,192 @@ impl Storage {
         Ok(())
     }
 
-    fn collect_live_entries(
-        iter: impl Iterator<Item = Result<(fjall::Slice, fjall::Slice), fjall::Error>>,
-        limit: usize,
-        results: &mut Vec<(Vec<u8>, IndexJob)>,
-        poisoned: &mut Vec<Vec<u8>>,
-    ) -> Result<(), WintermuteError> {
-        for entry in iter.take(limit - results.len()) {
-            let (key, value) = entry?;
-            match ciborium::from_reader(value.as_ref()) {
-                Ok(job) => results.push((key.to_vec(), job)),
+    /// Decodes a batch of log records, dropping any that fail to
+    /// deserialize so a poison entry cannot wedge the queue. Returns the
+    /// jobs and the number dropped.
+    fn decode_jobs<T: serde::de::DeserializeOwned>(
+        queue: &str,
+        records: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> (Vec<(Vec<u8>, T)>, usize) {
+        let mut out = Vec::with_capacity(records.len());
+        let mut dropped = 0usize;
+        for (key, bytes) in records {
+            match decode(&bytes) {
+                Ok(job) => out.push((key, job)),
                 Err(e) => {
-                    tracing::error!("dropping undeserializable firehose_live entry: {e}");
-                    poisoned.push(key.to_vec());
+                    tracing::error!("dropping undeserializable {queue} entry: {e}");
+                    dropped += 1;
                 }
             }
         }
-        Ok(())
+        (out, dropped)
     }
 
-    /// Dequeue up to `limit` live jobs in arrival order. The legacy uri-keyed
-    /// partition drains completely first (existing entries predate the
-    /// sequence keys); afterwards the forward-only sequence scan starts after
-    /// the last dequeued key, so removal tombstones are never revisited.
+    /// Dequeue up to `limit` live jobs in arrival order.
     pub fn dequeue_firehose_live_batch(
         &self,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, IndexJob)>, WintermuteError> {
         let start = std::time::Instant::now();
-        let mut legacy = false;
-        let results = if self.legacy_live_drained.load(Ordering::Relaxed) {
-            self.dequeue_live_seq_batch(limit)?
-        } else {
-            let legacy_results = self.dequeue_live_legacy_batch(limit)?;
-            if legacy_results.is_empty() {
-                self.legacy_live_drained.store(true, Ordering::Relaxed);
-                if let Err(e) = self
-                    .cursors
-                    .insert(LIVE_LEGACY_DRAINED.as_bytes(), 1u8.to_be_bytes())
-                {
-                    tracing::warn!("failed to persist legacy-drained flag: {e}");
-                }
-                tracing::info!("legacy firehose_live partition drained, switching to seq keys");
-                self.dequeue_live_seq_batch(limit)?
-            } else {
-                legacy = true;
-                legacy_results
-            }
-        };
+        let records = self.firehose_live.read_batch(limit)?;
+        let (jobs, dropped) = Self::decode_jobs("firehose_live", records);
+        #[allow(clippy::cast_possible_wrap)]
+        crate::metrics::INGESTER_FIREHOSE_LIVE_LENGTH.sub((jobs.len() + dropped) as i64);
         let elapsed_ms = start.elapsed().as_millis();
         if elapsed_ms > 1000 {
-            tracing::warn!(
-                "SLOW live dequeue: {elapsed_ms}ms for {} jobs (legacy={legacy})",
-                results.len()
-            );
+            tracing::warn!("SLOW live dequeue: {elapsed_ms}ms for {} jobs", jobs.len());
         }
-        Ok(results)
+        Ok(jobs)
     }
 
-    /// Forward-only scan of the sequence-keyed partition.
-    fn dequeue_live_seq_batch(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<(Vec<u8>, IndexJob)>, WintermuteError> {
-        let cursor = self
-            .firehose_live_seq_cursor
-            .lock()
-            .map_or(None, |c| c.clone());
+    // ---- firehose_backfill -------------------------------------------------
+    //
+    // Normal items are spread over BACKFILL_SHARDS logs so that N indexer
+    // workers each own a disjoint slice and never contend on a head lock.
+    // Priority items go to one shared log that every worker drains first.
 
-        let mut results = Vec::with_capacity(limit);
-        let mut poisoned: Vec<Vec<u8>> = Vec::new();
-        if let Some(after) = cursor {
-            let range = (Bound::Excluded(after), Bound::<Vec<u8>>::Unbounded);
-            Self::collect_live_entries(
-                self.firehose_live_seq.range(range),
-                limit,
-                &mut results,
-                &mut poisoned,
-            )?;
-        } else {
-            Self::collect_live_entries(
-                self.firehose_live_seq.iter(),
-                limit,
-                &mut results,
-                &mut poisoned,
-            )?;
-        }
-
-        let last_key = results
-            .last()
-            .map(|(k, _)| k.clone())
-            .or_else(|| poisoned.last().cloned());
-        if let (Some(key), Ok(mut guard)) = (last_key, self.firehose_live_seq_cursor.lock()) {
-            self.cursors
-                .insert(LIVE_SEQ_READ_CURSOR.as_bytes(), key.as_slice())?;
-            *guard = Some(key);
-        } else if results.is_empty() && poisoned.is_empty() {
-            // A wiped-and-recreated partition restarts seq keys from zero; a
-            // persisted cursor from before the wipe would then skip everything.
-            if let Some((first, _)) = self.firehose_live_seq.first_key_value()? {
-                let stale = self
-                    .firehose_live_seq_cursor
-                    .lock()
-                    .ok()
-                    .and_then(|g| g.clone())
-                    .is_some_and(|c| first.as_ref() < c.as_slice());
-                if stale {
-                    tracing::warn!("live seq read cursor is ahead of the partition; resetting");
-                    if let Ok(mut guard) = self.firehose_live_seq_cursor.lock() {
-                        *guard = None;
-                    }
-                    self.cursors.remove(LIVE_SEQ_READ_CURSOR.as_bytes())?;
-                }
-            }
-        }
-
-        for (key, _) in &results {
-            self.firehose_live_seq.remove(key.as_slice())?;
-        }
-        for key in &poisoned {
-            self.firehose_live_seq.remove(key.as_slice())?;
-        }
-
-        #[allow(clippy::cast_possible_wrap)]
-        crate::metrics::INGESTER_FIREHOSE_LIVE_LENGTH.sub((results.len() + poisoned.len()) as i64);
-        Ok(results)
+    fn backfill_key(shard: usize, key: &[u8]) -> Vec<u8> {
+        let mut full = Vec::with_capacity(2 + key.len());
+        #[allow(clippy::cast_possible_truncation)]
+        full.extend_from_slice(&(shard as u16).to_be_bytes());
+        full.extend_from_slice(key);
+        full
     }
 
-    /// Sweep-cursor scan of the legacy uri-keyed partition: resumes after the
-    /// last dequeued key and wraps to the partition start when exhausted.
-    /// Undeserializable entries are removed and skipped so a poison entry
-    /// cannot wedge the sweep.
-    fn dequeue_live_legacy_batch(
-        &self,
-        limit: usize,
-    ) -> Result<Vec<(Vec<u8>, IndexJob)>, WintermuteError> {
-        let cursor = self.firehose_live_cursor.lock().map_or(None, |c| c.clone());
-
-        let mut results = Vec::with_capacity(limit);
-        let mut poisoned: Vec<Vec<u8>> = Vec::new();
-
-        if let Some(after) = cursor {
-            let range = (
-                std::ops::Bound::Excluded(after),
-                std::ops::Bound::<Vec<u8>>::Unbounded,
-            );
-            Self::collect_live_entries(
-                self.firehose_live.range(range),
-                limit,
-                &mut results,
-                &mut poisoned,
-            )?;
-        }
-        if results.is_empty() && poisoned.is_empty() {
-            // Wrap to the partition start to sweep keys behind the cursor
-            Self::collect_live_entries(
-                self.firehose_live.iter(),
-                limit,
-                &mut results,
-                &mut poisoned,
-            )?;
-        }
-
-        let last_key = results
-            .last()
-            .map(|(k, _)| k.clone())
-            .or_else(|| poisoned.last().cloned());
-        if let (Some(key), Ok(mut guard)) = (last_key, self.firehose_live_cursor.lock()) {
-            *guard = Some(key);
-        }
-
-        for (key, _) in &results {
-            self.firehose_live.remove(key.as_slice())?;
-        }
-        for key in &poisoned {
-            self.firehose_live.remove(key.as_slice())?;
-        }
-
-        #[allow(clippy::cast_possible_wrap)]
-        crate::metrics::INGESTER_FIREHOSE_LIVE_LENGTH.sub((results.len() + poisoned.len()) as i64);
-        Ok(results)
+    fn random_shard() -> usize {
+        rand::random::<usize>() % BACKFILL_SHARDS
     }
 
-    // Firehose backfill queue (from backfiller) - uses LMDB for consistent sub-ms iteration
-    // Uses key-prefix partitioning for fast parallel dequeue:
-    // - Priority items: prefix "0:" (processed first by all workers)
-    // - Normal items: prefix "{XX}:" where XX is random hex in range 10-ff
-    // Workers claim partitions of the key space for contention-free dequeue
-
-    /// Enqueue a firehose backfill job with normal priority (random prefix 10-ff)
-    /// The random prefix enables partitioned dequeue where each worker owns a key range
+    /// Enqueue a firehose backfill job with normal priority into a random shard.
     pub fn enqueue_firehose_backfill(&self, job: &IndexJob) -> Result<(), WintermuteError> {
-        // Key format: "{XX}:{timestamp}:{uri}" where XX is random hex in range 10-ff
-        // This distributes items across 240 buckets for parallel dequeue
-        let prefix: u8 = rand::random::<u8>().saturating_add(16).max(16); // 16-255 (0x10-0xff)
-        let key = format!(
-            "{:02x}:{}:{}",
-            prefix,
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-            job.uri
-        );
-        let mut value = Vec::new();
-        ciborium::into_writer(job, &mut value)
-            .map_err(|e| WintermuteError::Serialization(format!("failed to serialize job: {e}")))?;
-
-        let mut wtxn = self
-            .lmdb_env
-            .write_txn()
-            .map_err(|e| WintermuteError::Other(format!("LMDB write txn failed: {e}")))?;
-        self.firehose_backfill_db
-            .put(&mut wtxn, key.as_bytes(), &value)
-            .map_err(|e| WintermuteError::Other(format!("LMDB put failed: {e}")))?;
-        wtxn.commit()
-            .map_err(|e| WintermuteError::Other(format!("LMDB commit failed: {e}")))?;
-
+        self.firehose_backfill_shards[Self::random_shard()].append(&encode(job)?)?;
         crate::metrics::INGESTER_FIREHOSE_BACKFILL_LENGTH.inc();
         Ok(())
     }
 
-    /// Batch enqueue multiple firehose backfill jobs in a single transaction
+    /// Batch enqueue multiple firehose backfill jobs.
     pub fn enqueue_firehose_backfill_batch(
         &self,
         jobs: &[IndexJob],
     ) -> Result<(), WintermuteError> {
-        if jobs.is_empty() {
-            return Ok(());
-        }
-
-        let mut wtxn = self
-            .lmdb_env
-            .write_txn()
-            .map_err(|e| WintermuteError::Other(format!("LMDB write txn failed: {e}")))?;
-
         for job in jobs {
-            let prefix: u8 = rand::random::<u8>().saturating_add(16).max(16);
-            let key = format!(
-                "{:02x}:{}:{}",
-                prefix,
-                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                job.uri
-            );
-            let mut value = Vec::new();
-            ciborium::into_writer(job, &mut value).map_err(|e| {
-                WintermuteError::Serialization(format!("failed to serialize job: {e}"))
-            })?;
-            self.firehose_backfill_db
-                .put(&mut wtxn, key.as_bytes(), &value)
-                .map_err(|e| WintermuteError::Other(format!("LMDB put failed: {e}")))?;
+            self.firehose_backfill_shards[Self::random_shard()].append(&encode(job)?)?;
         }
-
-        wtxn.commit()
-            .map_err(|e| WintermuteError::Other(format!("LMDB commit failed: {e}")))?;
-
         #[allow(clippy::cast_possible_wrap)]
         crate::metrics::INGESTER_FIREHOSE_BACKFILL_LENGTH.add(jobs.len() as i64);
         Ok(())
     }
 
-    /// Enqueue a firehose backfill job with HIGH priority (prefix "0:")
-    /// Priority items are indexed BEFORE all normal backfill items
+    /// Enqueue a firehose backfill job with HIGH priority.
+    /// Priority items are indexed BEFORE all normal backfill items.
     pub fn enqueue_firehose_backfill_priority(
         &self,
         job: &IndexJob,
     ) -> Result<(), WintermuteError> {
-        // Key format: "0:{timestamp}:{uri}" - "0:" prefix for high priority
-        // "0:" sorts before "10:" so priority items are always first
-        let key = format!(
-            "0:{}:{}",
-            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-            job.uri
-        );
-        let mut value = Vec::new();
-        ciborium::into_writer(job, &mut value)
-            .map_err(|e| WintermuteError::Serialization(format!("failed to serialize job: {e}")))?;
-
-        let mut wtxn = self
-            .lmdb_env
-            .write_txn()
-            .map_err(|e| WintermuteError::Other(format!("LMDB write txn failed: {e}")))?;
-        self.firehose_backfill_db
-            .put(&mut wtxn, key.as_bytes(), &value)
-            .map_err(|e| WintermuteError::Other(format!("LMDB put failed: {e}")))?;
-        wtxn.commit()
-            .map_err(|e| WintermuteError::Other(format!("LMDB commit failed: {e}")))?;
-
+        self.firehose_backfill_priority.append(&encode(job)?)?;
         crate::metrics::INGESTER_FIREHOSE_BACKFILL_LENGTH.inc();
         Ok(())
     }
 
-    /// Batch enqueue multiple firehose backfill jobs with HIGH priority in a single transaction
+    /// Batch enqueue multiple firehose backfill jobs with HIGH priority.
     pub fn enqueue_firehose_backfill_priority_batch(
         &self,
         jobs: &[IndexJob],
     ) -> Result<(), WintermuteError> {
-        if jobs.is_empty() {
-            return Ok(());
-        }
-
-        let mut wtxn = self
-            .lmdb_env
-            .write_txn()
-            .map_err(|e| WintermuteError::Other(format!("LMDB write txn failed: {e}")))?;
-
         for job in jobs {
-            let key = format!(
-                "0:{}:{}",
-                chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
-                job.uri
-            );
-            let mut value = Vec::new();
-            ciborium::into_writer(job, &mut value).map_err(|e| {
-                WintermuteError::Serialization(format!("failed to serialize job: {e}"))
-            })?;
-            self.firehose_backfill_db
-                .put(&mut wtxn, key.as_bytes(), &value)
-                .map_err(|e| WintermuteError::Other(format!("LMDB put failed: {e}")))?;
+            self.firehose_backfill_priority.append(&encode(job)?)?;
         }
-
-        wtxn.commit()
-            .map_err(|e| WintermuteError::Other(format!("LMDB commit failed: {e}")))?;
-
         #[allow(clippy::cast_possible_wrap)]
         crate::metrics::INGESTER_FIREHOSE_BACKFILL_LENGTH.add(jobs.len() as i64);
         Ok(())
+    }
+
+    /// Drains up to `limit` jobs from the priority log, then from the given
+    /// shard range in order.
+    fn drain_backfill(
+        &self,
+        shards: std::ops::Range<usize>,
+        limit: usize,
+    ) -> Result<Vec<(Vec<u8>, IndexJob)>, WintermuteError> {
+        let mut results = Vec::with_capacity(limit);
+        let mut dropped = 0usize;
+
+        let (jobs, d) = Self::decode_jobs::<IndexJob>(
+            "firehose_backfill",
+            self.firehose_backfill_priority.read_batch(limit)?,
+        );
+        dropped += d;
+        results.extend(
+            jobs.into_iter()
+                .map(|(k, j)| (Self::backfill_key(BACKFILL_SHARDS, &k), j)),
+        );
+
+        for shard in shards {
+            if results.len() >= limit {
+                break;
+            }
+            let (jobs, d) = Self::decode_jobs::<IndexJob>(
+                "firehose_backfill",
+                self.firehose_backfill_shards[shard].read_batch(limit - results.len())?,
+            );
+            dropped += d;
+            results.extend(
+                jobs.into_iter()
+                    .map(|(k, j)| (Self::backfill_key(shard, &k), j)),
+            );
+        }
+
+        #[allow(clippy::cast_possible_wrap)]
+        crate::metrics::INGESTER_FIREHOSE_BACKFILL_LENGTH.sub((results.len() + dropped) as i64);
+        Ok(results)
     }
 
     pub fn dequeue_firehose_backfill(
         &self,
     ) -> Result<Option<(Vec<u8>, IndexJob)>, WintermuteError> {
-        let rtxn = self
-            .lmdb_env
-            .read_txn()
-            .map_err(|e| WintermuteError::Other(format!("LMDB read txn failed: {e}")))?;
-
-        let mut iter = self
-            .firehose_backfill_db
-            .iter(&rtxn)
-            .map_err(|e| WintermuteError::Other(format!("LMDB iter failed: {e}")))?;
-
-        let Some(entry) = iter.next() else {
-            return Ok(None);
-        };
-
-        let (key, value) =
-            entry.map_err(|e| WintermuteError::Other(format!("LMDB iter error: {e}")))?;
-        let key_vec = key.to_vec();
-        let job: IndexJob = ciborium::from_reader(value)
-            .map_err(|e| WintermuteError::Serialization(format!("failed to deserialize: {e}")))?;
-
-        drop(iter);
-        drop(rtxn);
-
-        // Remove the item
-        let mut wtxn = self
-            .lmdb_env
-            .write_txn()
-            .map_err(|e| WintermuteError::Other(format!("LMDB write txn failed: {e}")))?;
-        self.firehose_backfill_db
-            .delete(&mut wtxn, &key_vec)
-            .map_err(|e| WintermuteError::Other(format!("LMDB delete failed: {e}")))?;
-        wtxn.commit()
-            .map_err(|e| WintermuteError::Other(format!("LMDB commit failed: {e}")))?;
-
-        crate::metrics::INGESTER_FIREHOSE_BACKFILL_LENGTH.dec();
-        Ok(Some((key_vec, job)))
+        let mut batch = self.dequeue_firehose_backfill_batch(1)?;
+        if batch.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(batch.remove(0)))
+        }
     }
 
-    /// Batch dequeue up to `limit` jobs from `firehose_backfill` in a single iteration
-    /// LMDB provides consistent sub-ms latency regardless of queue size
+    /// Batch dequeue up to `limit` jobs from `firehose_backfill`: priority
+    /// first, then every shard in order.
     pub fn dequeue_firehose_backfill_batch(
         &self,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, IndexJob)>, WintermuteError> {
-        let mut results = Vec::with_capacity(limit);
-
-        let rtxn = self
-            .lmdb_env
-            .read_txn()
-            .map_err(|e| WintermuteError::Other(format!("LMDB read txn failed: {e}")))?;
-
-        let iter = self
-            .firehose_backfill_db
-            .iter(&rtxn)
-            .map_err(|e| WintermuteError::Other(format!("LMDB iter failed: {e}")))?;
-
-        for entry in iter.take(limit) {
-            let (key, value) =
-                entry.map_err(|e| WintermuteError::Other(format!("LMDB iter error: {e}")))?;
-            let key_vec = key.to_vec();
-            let job: IndexJob = ciborium::from_reader(value).map_err(|e| {
-                WintermuteError::Serialization(format!("failed to deserialize: {e}"))
-            })?;
-            results.push((key_vec, job));
-        }
-
-        drop(rtxn);
-
-        // Remove all dequeued items in a single transaction
-        if !results.is_empty() {
-            let mut wtxn = self
-                .lmdb_env
-                .write_txn()
-                .map_err(|e| WintermuteError::Other(format!("LMDB write txn failed: {e}")))?;
-            for (key, _) in &results {
-                self.firehose_backfill_db
-                    .delete(&mut wtxn, key)
-                    .map_err(|e| WintermuteError::Other(format!("LMDB delete failed: {e}")))?;
-            }
-            wtxn.commit()
-                .map_err(|e| WintermuteError::Other(format!("LMDB commit failed: {e}")))?;
-
-            #[allow(clippy::cast_possible_wrap)]
-            crate::metrics::INGESTER_FIREHOSE_BACKFILL_LENGTH.sub(results.len() as i64);
-        }
-
-        Ok(results)
+        self.drain_backfill(0..BACKFILL_SHARDS, limit)
     }
 
-    /// Partitioned dequeue for parallel workers - each worker owns a slice of the key space
+    /// Partitioned dequeue for parallel workers - each worker owns a slice of the shards.
     ///
-    /// Key space partitioning:
-    /// - Priority items (prefix "0:") are checked first by ALL workers
-    /// - Normal items (prefix "10"-"ff") are partitioned among workers
+    /// - Priority items are checked first by ALL workers
+    /// - Normal items are partitioned among workers
     ///
-    /// With N workers, worker i owns prefixes in range [start, end) where:
-    /// - start = 0x10 + (i * 240 / N)
-    /// - end = 0x10 + ((i + 1) * 240 / N)
+    /// With N workers, worker i owns shards in range [start, end) where:
+    /// - start = i * 240 / N
+    /// - end = (i + 1) * 240 / N (the last worker takes the remainder)
     ///
-    /// This eliminates contention since each worker reads from its own partition.
-    /// LMDB provides consistent sub-ms latency for all range scans.
+    /// Each shard is its own log with its own head, so workers never
+    /// contend except on the shared priority log.
     pub fn dequeue_firehose_backfill_partitioned(
         &self,
         worker_id: usize,
         num_workers: usize,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, IndexJob)>, WintermuteError> {
-        let mut results = Vec::with_capacity(limit);
-
-        let rtxn = self
-            .lmdb_env
-            .read_txn()
-            .map_err(|e| WintermuteError::Other(format!("LMDB read txn failed: {e}")))?;
-
-        // First, check for priority items (all workers can grab these)
-        // Priority prefix "0:" sorts before "10:"
-        let priority_start: &[u8] = b"0:";
-        let priority_end: &[u8] = b"0;";
-        let priority_bounds = (
-            Bound::Included(priority_start),
-            Bound::Excluded(priority_end),
-        );
-        let priority_range = self
-            .firehose_backfill_db
-            .range(&rtxn, &priority_bounds)
-            .map_err(|e| WintermuteError::Other(format!("LMDB range failed: {e}")))?;
-
-        for entry in priority_range {
-            if results.len() >= limit {
-                break;
-            }
-            let (key, value) =
-                entry.map_err(|e| WintermuteError::Other(format!("LMDB iter error: {e}")))?;
-            let key_vec = key.to_vec();
-            let job: IndexJob = ciborium::from_reader(value).map_err(|e| {
-                WintermuteError::Serialization(format!("failed to deserialize: {e}"))
-            })?;
-            results.push((key_vec, job));
-        }
-
-        // If we got enough priority items, batch remove and return early
-        if results.len() >= limit {
-            drop(rtxn);
-            self.batch_remove_firehose_backfill(&results)?;
-            return Ok(results);
-        }
-
-        // Handle legacy items with "1:" prefix (from before partitioning was added)
-        let legacy_start: &[u8] = b"1:";
-        let legacy_end: &[u8] = b"1;";
-        let legacy_bounds = (Bound::Included(legacy_start), Bound::Excluded(legacy_end));
-        let legacy_range = self
-            .firehose_backfill_db
-            .range(&rtxn, &legacy_bounds)
-            .map_err(|e| WintermuteError::Other(format!("LMDB range failed: {e}")))?;
-
-        for entry in legacy_range {
-            if results.len() >= limit {
-                break;
-            }
-            let (key, value) =
-                entry.map_err(|e| WintermuteError::Other(format!("LMDB iter error: {e}")))?;
-            let key_vec = key.to_vec();
-            let job: IndexJob = ciborium::from_reader(value).map_err(|e| {
-                WintermuteError::Serialization(format!("failed to deserialize: {e}"))
-            })?;
-            results.push((key_vec, job));
-        }
-
-        // If we got enough items from legacy queue, batch remove and return early
-        if results.len() >= limit {
-            drop(rtxn);
-            self.batch_remove_firehose_backfill(&results)?;
-            return Ok(results);
-        }
-
-        // Calculate this worker's partition range (prefixes 0x10 to 0xff = 240 values)
-        let partition_size = 240 / num_workers;
-        let start_prefix = 0x10 + (worker_id * partition_size);
-        let end_prefix = if worker_id == num_workers - 1 {
-            0x100 // Last worker gets remainder
+        let num_workers = num_workers.max(1);
+        let partition_size = BACKFILL_SHARDS / num_workers;
+        let start = (worker_id * partition_size).min(BACKFILL_SHARDS);
+        let end = if worker_id + 1 == num_workers {
+            BACKFILL_SHARDS
         } else {
-            0x10 + ((worker_id + 1) * partition_size)
+            ((worker_id + 1) * partition_size).min(BACKFILL_SHARDS)
         };
-
-        // Build range keys
-        let start_key = format!("{start_prefix:02x}:");
-        let end_key_string;
-        let end_key: &[u8] = if worker_id == num_workers - 1 {
-            // Last worker reads to end of keyspace
-            &[0xff, 0xff]
-        } else {
-            end_key_string = format!("{end_prefix:02x}:");
-            end_key_string.as_bytes()
-        };
-
-        // Iterate over this worker's partition using LMDB range
-        let partition_bounds = (
-            Bound::Included(start_key.as_bytes()),
-            Bound::Excluded(end_key),
-        );
-        let partition_range = self
-            .firehose_backfill_db
-            .range(&rtxn, &partition_bounds)
-            .map_err(|e| WintermuteError::Other(format!("LMDB range failed: {e}")))?;
-
-        for entry in partition_range {
-            if results.len() >= limit {
-                break;
-            }
-            let (key, value) =
-                entry.map_err(|e| WintermuteError::Other(format!("LMDB iter error: {e}")))?;
-            let key_vec = key.to_vec();
-            let job: IndexJob = ciborium::from_reader(value).map_err(|e| {
-                WintermuteError::Serialization(format!("failed to deserialize: {e}"))
-            })?;
-            results.push((key_vec, job));
-        }
-
-        drop(rtxn);
-
-        // Batch remove all dequeued items
-        self.batch_remove_firehose_backfill(&results)?;
-
-        Ok(results)
-    }
-
-    /// Helper to batch remove items from `firehose_backfill` queue using LMDB
-    fn batch_remove_firehose_backfill(
-        &self,
-        items: &[(Vec<u8>, IndexJob)],
-    ) -> Result<(), WintermuteError> {
-        if items.is_empty() {
-            return Ok(());
-        }
-
-        let mut wtxn = self
-            .lmdb_env
-            .write_txn()
-            .map_err(|e| WintermuteError::Other(format!("LMDB write txn failed: {e}")))?;
-
-        for (key, _) in items {
-            self.firehose_backfill_db
-                .delete(&mut wtxn, key)
-                .map_err(|e| WintermuteError::Other(format!("LMDB delete failed: {e}")))?;
-        }
-
-        wtxn.commit()
-            .map_err(|e| WintermuteError::Other(format!("LMDB commit failed: {e}")))?;
-
-        #[allow(clippy::cast_possible_wrap)]
-        crate::metrics::INGESTER_FIREHOSE_BACKFILL_LENGTH.sub(items.len() as i64);
-        Ok(())
+        self.drain_backfill(start..end, limit)
     }
 
     #[allow(clippy::missing_const_for_fn)]
@@ -937,36 +631,24 @@ impl Storage {
         Ok(())
     }
 
-    // Label live queue (future implementation)
-    pub fn enqueue_label_live(
-        &self,
-        event: &crate::types::LabelEvent,
-    ) -> Result<(), WintermuteError> {
-        let key = format!("{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0));
-        let mut value = Vec::new();
-        ciborium::into_writer(event, &mut value).map_err(|e| {
-            WintermuteError::Serialization(format!("failed to serialize event: {e}"))
-        })?;
-        self.label_live.insert(key.as_bytes(), value.as_slice())?;
+    // ---- label_live --------------------------------------------------------
+
+    pub fn enqueue_label_live(&self, event: &LabelEvent) -> Result<(), WintermuteError> {
+        self.label_live.append(&encode(event)?)?;
         crate::metrics::INGESTER_LABEL_LIVE_LENGTH.inc();
         Ok(())
     }
 
-    pub fn dequeue_label_live(
-        &self,
-    ) -> Result<Option<(Vec<u8>, crate::types::LabelEvent)>, WintermuteError> {
-        let mut iter = self.label_live.iter();
-        let Some(entry) = iter.next() else {
-            return Ok(None);
-        };
-        let (key, value) = entry?;
-        let key_vec = key.to_vec();
-        let event = ciborium::from_reader(value.as_ref())
-            .map_err(|e| WintermuteError::Serialization(format!("failed to deserialize: {e}")))?;
-        // Remove immediately to prevent re-dequeue race condition
-        self.label_live.remove(&key_vec)?;
-        crate::metrics::INGESTER_LABEL_LIVE_LENGTH.dec();
-        Ok(Some((key_vec, event)))
+    pub fn dequeue_label_live(&self) -> Result<Option<(Vec<u8>, LabelEvent)>, WintermuteError> {
+        let records = self.label_live.read_batch(1)?;
+        let (mut events, dropped) = Self::decode_jobs::<LabelEvent>("label_live", records);
+        #[allow(clippy::cast_possible_wrap)]
+        crate::metrics::INGESTER_LABEL_LIVE_LENGTH.sub((events.len() + dropped) as i64);
+        if events.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(events.remove(0)))
+        }
     }
 
     #[allow(clippy::missing_const_for_fn)]
@@ -975,110 +657,89 @@ impl Storage {
         Ok(())
     }
 
+    // ---- cursors -----------------------------------------------------------
+
     pub fn get_cursor(&self, name: &str) -> Result<Option<i64>, WintermuteError> {
-        let Some(value) = self.cursors.get(name.as_bytes())? else {
-            return Ok(None);
-        };
-        let bytes: [u8; 8] = value
-            .as_ref()
-            .try_into()
-            .map_err(|_| WintermuteError::Other("invalid cursor format".into()))?;
-        Ok(Some(i64::from_be_bytes(bytes)))
+        Ok(self.cursors.get(name))
     }
 
     pub fn set_cursor(&self, name: &str, value: i64) -> Result<(), WintermuteError> {
-        self.cursors.insert(name.as_bytes(), value.to_be_bytes())?;
-        Ok(())
+        self.cursors.update(|m| {
+            m.insert(name.to_owned(), value);
+        })
     }
 
     pub fn delete_cursor(&self, name: &str) -> Result<(), WintermuteError> {
-        self.cursors.remove(name.as_bytes())?;
-        Ok(())
+        self.cursors.update(|m| {
+            m.remove(name);
+        })
     }
 
+    // ---- lengths -----------------------------------------------------------
+    //
+    // Every log tracks its unread count, so exact and approximate lengths
+    // are the same O(1) read. Both names are kept for callers.
+
     pub fn repo_backfill_len(&self) -> Result<usize, WintermuteError> {
-        Ok(self.repo_backfill.len()?)
+        Ok(self.repo_backfill.len())
+    }
+
+    #[must_use]
+    pub fn repo_backfill_approx_len(&self) -> usize {
+        self.repo_backfill.len()
     }
 
     pub fn firehose_live_len(&self) -> Result<usize, WintermuteError> {
-        Ok(self.firehose_live.len()? + self.firehose_live_seq.len()?)
+        Ok(self.firehose_live.len())
+    }
+
+    #[must_use]
+    pub fn firehose_live_approx_len(&self) -> usize {
+        self.firehose_live.len()
     }
 
     pub fn firehose_backfill_len(&self) -> Result<usize, WintermuteError> {
-        let rtxn = self
-            .lmdb_env
-            .read_txn()
-            .map_err(|e| WintermuteError::Other(format!("LMDB read txn failed: {e}")))?;
-        let len = self
-            .firehose_backfill_db
-            .len(&rtxn)
-            .map_err(|e| WintermuteError::Other(format!("LMDB len failed: {e}")))?;
-        #[allow(clippy::cast_possible_truncation)]
-        Ok(len as usize)
+        Ok(self.firehose_backfill_priority.len()
+            + self
+                .firehose_backfill_shards
+                .iter()
+                .map(SegmentedLog::len)
+                .sum::<usize>())
     }
 
     pub fn label_live_len(&self) -> Result<usize, WintermuteError> {
-        Ok(self.label_live.len()?)
+        Ok(self.label_live.len())
     }
+
+    #[must_use]
+    pub fn label_live_approx_len(&self) -> usize {
+        self.label_live.len()
+    }
+
+    // ---- operator helpers --------------------------------------------------
 
     /// Peek at the first N items in `repo_backfill` without removing them
     pub fn peek_backfill(
         &self,
         limit: usize,
     ) -> Result<Vec<(Vec<u8>, BackfillJob)>, WintermuteError> {
-        let mut results = Vec::with_capacity(limit);
-        let mut iter = self.repo_backfill.iter();
-        for _ in 0..limit {
-            let Some(entry) = iter.next() else {
-                break;
-            };
-            let (key, value) = entry?;
-            let key_vec = key.to_vec();
-            let job: BackfillJob = ciborium::from_reader(value.as_ref())
-                .map_err(|e| WintermuteError::Serialization(format!("deserialize failed: {e}")))?;
-            results.push((key_vec, job));
-        }
-        Ok(results)
+        self.repo_backfill.peek(limit)
     }
 
     /// Remove all entries for a specific DID from `repo_backfill`
     /// Returns the number of entries removed
     pub fn remove_backfill_by_did(&self, did: &str) -> Result<usize, WintermuteError> {
-        let mut removed = 0;
-        let mut keys_to_remove = Vec::new();
-
-        for entry in self.repo_backfill.iter() {
-            let (key, value) = entry?;
-            let job: BackfillJob = ciborium::from_reader(value.as_ref())
-                .map_err(|e| WintermuteError::Serialization(format!("deserialize failed: {e}")))?;
-            if job.did == did {
-                keys_to_remove.push(key.to_vec());
-            }
-        }
-
-        for key in keys_to_remove {
-            self.repo_backfill.remove(&key)?;
-            crate::metrics::INGESTER_REPO_BACKFILL_LENGTH.dec();
-            removed += 1;
-        }
-
+        let removed = self.repo_backfill.remove_by_did(did)?;
+        #[allow(clippy::cast_possible_wrap)]
+        crate::metrics::INGESTER_REPO_BACKFILL_LENGTH.sub(removed as i64);
         Ok(removed)
     }
 
     /// Clear all items from `repo_backfill`
     pub fn clear_repo_backfill(&self) -> Result<(), WintermuteError> {
-        let mut keys_to_remove = Vec::new();
-
-        for entry in self.repo_backfill.iter() {
-            let (key, _) = entry?;
-            keys_to_remove.push(key.to_vec());
-        }
-
-        for key in keys_to_remove {
-            self.repo_backfill.remove(&key)?;
-            crate::metrics::INGESTER_REPO_BACKFILL_LENGTH.dec();
-        }
-
+        let removed = self.repo_backfill.clear()?;
+        #[allow(clippy::cast_possible_wrap)]
+        crate::metrics::INGESTER_REPO_BACKFILL_LENGTH.sub(removed as i64);
         Ok(())
     }
 }
@@ -1086,9 +747,7 @@ impl Storage {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::{
-        BackfillJob, CommitData, FirehoseEvent, IndexJob, Label, LabelEvent, WriteAction,
-    };
+    use crate::types::{CommitData, Label, WriteAction};
     use tempfile::TempDir;
 
     fn setup_test_storage() -> (Storage, TempDir) {
@@ -1096,6 +755,26 @@ mod tests {
         let db_path = temp_dir.path().join("test_db");
         let storage = Storage::new(Some(db_path)).unwrap();
         (storage, temp_dir)
+    }
+
+    fn index_job(uri: &str) -> IndexJob {
+        IndexJob {
+            uri: uri.to_owned(),
+            cid: "cid".to_owned(),
+            action: WriteAction::Create,
+            record: Some(serde_json::json!({"test": "data"})),
+            indexed_at: "2025-01-01T00:00:00Z".to_owned(),
+            rev: "rev".to_owned(),
+            provenance: None,
+        }
+    }
+
+    fn backfill_job(did: &str, priority: bool) -> BackfillJob {
+        BackfillJob {
+            did: did.to_owned(),
+            retry_count: 0,
+            priority,
+        }
     }
 
     #[test]
@@ -1118,27 +797,19 @@ mod tests {
         };
 
         storage.write_firehose_event(12345, &event).unwrap();
-        let retrieved = storage.read_firehose_event(12345).unwrap();
-
-        assert!(retrieved.is_some());
-        let retrieved = retrieved.unwrap();
+        let retrieved = storage.read_firehose_event(12345).unwrap().unwrap();
         assert_eq!(retrieved.seq, event.seq);
         assert_eq!(retrieved.did, event.did);
+        assert!(storage.read_firehose_event(99999).unwrap().is_none());
     }
 
     #[test]
     fn test_backfill_queue() {
         let (storage, _dir) = setup_test_storage();
-
-        let job = BackfillJob {
-            did: "did:plc:test456".to_owned(),
-            retry_count: 0,
-            priority: false,
-        };
+        let job = backfill_job("did:plc:test456", false);
 
         storage.enqueue_backfill(&job).unwrap();
         let (key, retrieved) = storage.dequeue_backfill().unwrap().unwrap();
-
         assert_eq!(retrieved.did, job.did);
         assert_eq!(retrieved.retry_count, job.retry_count);
 
@@ -1150,75 +821,44 @@ mod tests {
     fn test_backfill_priority_queue() {
         let (storage, _dir) = setup_test_storage();
 
-        // First, enqueue normal priority items
-        let normal1 = BackfillJob {
-            did: "did:plc:normal1".to_owned(),
-            retry_count: 0,
-            priority: false,
-        };
-        let normal2 = BackfillJob {
-            did: "did:plc:normal2".to_owned(),
-            retry_count: 0,
-            priority: false,
-        };
-        storage.enqueue_backfill(&normal1).unwrap();
-        storage.enqueue_backfill(&normal2).unwrap();
+        storage
+            .enqueue_backfill(&backfill_job("did:plc:normal1", false))
+            .unwrap();
+        storage
+            .enqueue_backfill(&backfill_job("did:plc:normal2", false))
+            .unwrap();
+        storage
+            .enqueue_backfill_priority(&backfill_job("did:plc:priority1", true))
+            .unwrap();
+        storage
+            .enqueue_backfill_priority(&backfill_job("did:plc:priority2", true))
+            .unwrap();
+        storage
+            .enqueue_backfill_immediate(&backfill_job("did:plc:immediate", true))
+            .unwrap();
 
-        // Then, enqueue priority items (should come out FIRST despite being added later)
-        let priority1 = BackfillJob {
-            did: "did:plc:priority1".to_owned(),
-            retry_count: 0,
-            priority: true,
-        };
-        let priority2 = BackfillJob {
-            did: "did:plc:priority2".to_owned(),
-            retry_count: 0,
-            priority: true,
-        };
-        storage.enqueue_backfill_priority(&priority1).unwrap();
-        storage.enqueue_backfill_priority(&priority2).unwrap();
-
-        // Dequeue should return priority items first (0: prefix sorts before 1:)
-        let (_, first) = storage.dequeue_backfill().unwrap().unwrap();
+        let order: Vec<String> = std::iter::from_fn(|| storage.dequeue_backfill().unwrap())
+            .map(|(_, j)| j.did)
+            .collect();
         assert_eq!(
-            first.did, "did:plc:priority1",
-            "priority1 should come first"
+            order,
+            [
+                "did:plc:immediate",
+                "did:plc:priority1",
+                "did:plc:priority2",
+                "did:plc:normal1",
+                "did:plc:normal2",
+            ]
         );
-
-        let (_, second) = storage.dequeue_backfill().unwrap().unwrap();
-        assert_eq!(
-            second.did, "did:plc:priority2",
-            "priority2 should come second"
-        );
-
-        // Then normal items
-        let (_, third) = storage.dequeue_backfill().unwrap().unwrap();
-        assert_eq!(third.did, "did:plc:normal1", "normal1 should come third");
-
-        let (_, fourth) = storage.dequeue_backfill().unwrap().unwrap();
-        assert_eq!(fourth.did, "did:plc:normal2", "normal2 should come fourth");
-
-        // Queue should be empty
-        assert!(storage.dequeue_backfill().unwrap().is_none());
     }
 
     #[test]
     fn test_firehose_live_queue() {
         let (storage, _dir) = setup_test_storage();
-
-        let job = IndexJob {
-            uri: "at://did:plc:test/app.bsky.feed.post/123".to_owned(),
-            cid: "bafytest123".to_owned(),
-            action: WriteAction::Create,
-            record: Some(serde_json::json!({"test": "data"})),
-            indexed_at: "2025-01-01T00:00:00Z".to_owned(),
-            rev: "rev123".to_owned(),
-            provenance: None,
-        };
+        let job = index_job("at://did:plc:test/app.bsky.feed.post/123");
 
         storage.enqueue_firehose_live(&job).unwrap();
         let (key, retrieved) = storage.dequeue_firehose_live().unwrap().unwrap();
-
         assert_eq!(retrieved.uri, job.uri);
         assert_eq!(retrieved.cid, job.cid);
 
@@ -1229,22 +869,11 @@ mod tests {
     #[test]
     fn test_firehose_backfill_queue() {
         let (storage, _dir) = setup_test_storage();
-
-        let job = IndexJob {
-            uri: "at://did:plc:test/app.bsky.feed.post/456".to_owned(),
-            cid: "bafytest456".to_owned(),
-            action: WriteAction::Create,
-            record: Some(serde_json::json!({"test": "backfill"})),
-            indexed_at: "2025-01-01T00:00:00Z".to_owned(),
-            rev: "rev456".to_owned(),
-            provenance: None,
-        };
+        let job = index_job("at://did:plc:test/app.bsky.feed.post/456");
 
         storage.enqueue_firehose_backfill(&job).unwrap();
         let (key, retrieved) = storage.dequeue_firehose_backfill().unwrap().unwrap();
-
         assert_eq!(retrieved.uri, job.uri);
-        assert_eq!(retrieved.cid, job.cid);
 
         storage.remove_firehose_backfill(&key).unwrap();
         assert!(storage.dequeue_firehose_backfill().unwrap().is_none());
@@ -1254,236 +883,123 @@ mod tests {
     fn test_firehose_backfill_priority_queue() {
         let (storage, _dir) = setup_test_storage();
 
-        // First, enqueue normal priority items
-        let normal1 = IndexJob {
-            uri: "at://did:plc:normal/app.bsky.feed.post/1".to_owned(),
-            cid: "bafynormal1".to_owned(),
-            action: WriteAction::Create,
-            record: Some(serde_json::json!({"test": "normal1"})),
-            indexed_at: "2025-01-01T00:00:00Z".to_owned(),
-            rev: "rev1".to_owned(),
-            provenance: None,
-        };
-        let normal2 = IndexJob {
-            uri: "at://did:plc:normal/app.bsky.feed.post/2".to_owned(),
-            cid: "bafynormal2".to_owned(),
-            action: WriteAction::Create,
-            record: Some(serde_json::json!({"test": "normal2"})),
-            indexed_at: "2025-01-01T00:00:00Z".to_owned(),
-            rev: "rev2".to_owned(),
-            provenance: None,
-        };
-        storage.enqueue_firehose_backfill(&normal1).unwrap();
-        storage.enqueue_firehose_backfill(&normal2).unwrap();
-
-        // Then, enqueue priority items (should come out FIRST despite being added later)
-        let priority1 = IndexJob {
-            uri: "at://did:plc:priority/app.bsky.feed.post/1".to_owned(),
-            cid: "bafypriority1".to_owned(),
-            action: WriteAction::Create,
-            record: Some(serde_json::json!({"test": "priority1"})),
-            indexed_at: "2025-01-01T00:00:00Z".to_owned(),
-            rev: "rev3".to_owned(),
-            provenance: None,
-        };
-        let priority2 = IndexJob {
-            uri: "at://did:plc:priority/app.bsky.feed.post/2".to_owned(),
-            cid: "bafypriority2".to_owned(),
-            action: WriteAction::Create,
-            record: Some(serde_json::json!({"test": "priority2"})),
-            indexed_at: "2025-01-01T00:00:00Z".to_owned(),
-            rev: "rev4".to_owned(),
-            provenance: None,
-        };
         storage
-            .enqueue_firehose_backfill_priority(&priority1)
+            .enqueue_firehose_backfill(&index_job("at://did:plc:normal/app.bsky.feed.post/1"))
             .unwrap();
         storage
-            .enqueue_firehose_backfill_priority(&priority2)
+            .enqueue_firehose_backfill(&index_job("at://did:plc:normal/app.bsky.feed.post/2"))
+            .unwrap();
+        storage
+            .enqueue_firehose_backfill_priority(&index_job(
+                "at://did:plc:priority/app.bsky.feed.post/1",
+            ))
+            .unwrap();
+        storage
+            .enqueue_firehose_backfill_priority(&index_job(
+                "at://did:plc:priority/app.bsky.feed.post/2",
+            ))
             .unwrap();
 
-        // Dequeue should return priority items first (0: prefix sorts before 1:)
         let (_, first) = storage.dequeue_firehose_backfill().unwrap().unwrap();
-        assert!(
-            first.uri.contains("priority"),
-            "priority item should come first, got: {}",
-            first.uri
-        );
-
+        assert_eq!(first.uri, "at://did:plc:priority/app.bsky.feed.post/1");
         let (_, second) = storage.dequeue_firehose_backfill().unwrap().unwrap();
-        assert!(
-            second.uri.contains("priority"),
-            "priority item should come second, got: {}",
-            second.uri
-        );
+        assert_eq!(second.uri, "at://did:plc:priority/app.bsky.feed.post/2");
 
-        // Then normal items
-        let (_, third) = storage.dequeue_firehose_backfill().unwrap().unwrap();
-        assert!(
-            third.uri.contains("normal"),
-            "normal item should come third, got: {}",
-            third.uri
+        let mut rest: Vec<String> =
+            std::iter::from_fn(|| storage.dequeue_firehose_backfill().unwrap())
+                .map(|(_, j)| j.uri)
+                .collect();
+        rest.sort();
+        assert_eq!(
+            rest,
+            [
+                "at://did:plc:normal/app.bsky.feed.post/1",
+                "at://did:plc:normal/app.bsky.feed.post/2",
+            ]
         );
-
-        let (_, fourth) = storage.dequeue_firehose_backfill().unwrap().unwrap();
-        assert!(
-            fourth.uri.contains("normal"),
-            "normal item should come fourth, got: {}",
-            fourth.uri
-        );
-
-        // Queue should be empty
-        assert!(storage.dequeue_firehose_backfill().unwrap().is_none());
     }
 
     #[test]
     fn test_firehose_backfill_batch_dequeue() {
         let (storage, _dir) = setup_test_storage();
-
-        // Enqueue 10 jobs
         for i in 0..10 {
-            let job = IndexJob {
-                uri: format!("at://did:plc:test/app.bsky.feed.post/{i}"),
-                cid: format!("bafytest{i}"),
-                action: WriteAction::Create,
-                record: Some(serde_json::json!({"index": i})),
-                indexed_at: "2025-01-01T00:00:00Z".to_owned(),
-                rev: format!("rev{i}"),
-                provenance: None,
-            };
-            storage.enqueue_firehose_backfill(&job).unwrap();
+            storage
+                .enqueue_firehose_backfill(&index_job(&format!(
+                    "at://did:plc:test/app.bsky.feed.post/{i}"
+                )))
+                .unwrap();
         }
-
-        // Batch dequeue 5
-        let batch1 = storage.dequeue_firehose_backfill_batch(5).unwrap();
-        assert_eq!(batch1.len(), 5, "should dequeue exactly 5 items");
-
-        // Batch dequeue remaining 5
-        let batch2 = storage.dequeue_firehose_backfill_batch(5).unwrap();
-        assert_eq!(batch2.len(), 5, "should dequeue remaining 5 items");
-
-        // Queue should be empty
-        let batch3 = storage.dequeue_firehose_backfill_batch(5).unwrap();
-        assert_eq!(batch3.len(), 0, "should return empty when queue is empty");
-
-        // Regular dequeue should also return None
-        assert!(storage.dequeue_firehose_backfill().unwrap().is_none());
+        assert_eq!(storage.firehose_backfill_len().unwrap(), 10);
+        let batch = storage.dequeue_firehose_backfill_batch(4).unwrap();
+        assert_eq!(batch.len(), 4);
+        assert_eq!(storage.firehose_backfill_len().unwrap(), 6);
+        let batch = storage.dequeue_firehose_backfill_batch(100).unwrap();
+        assert_eq!(batch.len(), 6);
+        assert!(
+            storage
+                .dequeue_firehose_backfill_batch(100)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
     fn test_firehose_backfill_partitioned_dequeue() {
         let (storage, _dir) = setup_test_storage();
-
-        // Enqueue 20 jobs with random prefixes
-        for i in 0..20 {
-            let job = IndexJob {
-                uri: format!("at://did:plc:test/app.bsky.feed.post/part{i}"),
-                cid: format!("bafypart{i}"),
-                action: WriteAction::Create,
-                record: Some(serde_json::json!({"index": i})),
-                indexed_at: "2025-01-01T00:00:00Z".to_owned(),
-                rev: format!("rev{i}"),
-                provenance: None,
-            };
-            storage.enqueue_firehose_backfill(&job).unwrap();
+        for i in 0..200 {
+            storage
+                .enqueue_firehose_backfill(&index_job(&format!(
+                    "at://did:plc:test/app.bsky.feed.post/{i}"
+                )))
+                .unwrap();
         }
 
-        // Use 2 workers to partition the key space
-        let num_workers = 2;
-
-        // Worker 0 dequeues from its partition
-        let worker0_batch1 = storage
-            .dequeue_firehose_backfill_partitioned(0, num_workers, 10)
-            .unwrap();
-
-        // Worker 1 dequeues from its partition
-        let worker1_batch1 = storage
-            .dequeue_firehose_backfill_partitioned(1, num_workers, 10)
-            .unwrap();
-
-        // Both workers should get items (unless distribution is very unlucky)
-        // With 20 items across 240 buckets, expect at least some items per partition
-        let total_first_round = worker0_batch1.len() + worker1_batch1.len();
-
-        // Continue dequeuing until empty
-        let worker0_batch2 = storage
-            .dequeue_firehose_backfill_partitioned(0, num_workers, 10)
-            .unwrap();
-        let worker1_batch2 = storage
-            .dequeue_firehose_backfill_partitioned(1, num_workers, 10)
-            .unwrap();
-
-        let total_second_round = worker0_batch2.len() + worker1_batch2.len();
-
-        // All 20 items should have been dequeued
-        assert_eq!(
-            total_first_round + total_second_round,
-            20,
-            "all 20 items should be dequeued across partitions"
-        );
-
-        // Queue should now be empty
-        assert!(storage.dequeue_firehose_backfill().unwrap().is_none());
+        // Every worker's slice is disjoint, and the union is everything.
+        let num_workers = 4;
+        let mut seen = std::collections::HashSet::new();
+        for worker in 0..num_workers {
+            for (key, _) in storage
+                .dequeue_firehose_backfill_partitioned(worker, num_workers, 1000)
+                .unwrap()
+            {
+                assert!(seen.insert(key), "job dequeued by two workers");
+            }
+        }
+        assert_eq!(seen.len(), 200);
+        assert_eq!(storage.firehose_backfill_len().unwrap(), 0);
     }
 
     #[test]
     fn test_firehose_backfill_partitioned_priority() {
         let (storage, _dir) = setup_test_storage();
-
-        // Enqueue normal items
-        for i in 0..5 {
-            let job = IndexJob {
-                uri: format!("at://did:plc:normal/app.bsky.feed.post/{i}"),
-                cid: format!("bafynorm{i}"),
-                action: WriteAction::Create,
-                record: Some(serde_json::json!({"type": "normal"})),
-                indexed_at: "2025-01-01T00:00:00Z".to_owned(),
-                rev: format!("rev{i}"),
-                provenance: None,
-            };
-            storage.enqueue_firehose_backfill(&job).unwrap();
+        for i in 0..20 {
+            storage
+                .enqueue_firehose_backfill(&index_job(&format!(
+                    "at://did:plc:normal/app.bsky.feed.post/{i}"
+                )))
+                .unwrap();
         }
-
-        // Enqueue priority items
-        for i in 0..3 {
-            let job = IndexJob {
-                uri: format!("at://did:plc:priority/app.bsky.feed.post/{i}"),
-                cid: format!("bafypri{i}"),
-                action: WriteAction::Create,
-                record: Some(serde_json::json!({"type": "priority"})),
-                indexed_at: "2025-01-01T00:00:00Z".to_owned(),
-                rev: format!("rev_pri{i}"),
-                provenance: None,
-            };
-            storage.enqueue_firehose_backfill_priority(&job).unwrap();
-        }
-
-        // Worker 0 should get priority items first
-        let batch = storage
-            .dequeue_firehose_backfill_partitioned(0, 2, 10)
+        storage
+            .enqueue_firehose_backfill_priority(&index_job(
+                "at://did:plc:priority/app.bsky.feed.post/1",
+            ))
             .unwrap();
 
-        // Priority items should come first (they all have "priority" in the URI)
-        let priority_count = batch
-            .iter()
-            .take(3)
-            .filter(|(_, job)| job.uri.contains("priority"))
-            .count();
-        assert_eq!(
-            priority_count, 3,
-            "all 3 priority items should be at the start"
-        );
+        // Any worker sees the priority item first.
+        let batch = storage
+            .dequeue_firehose_backfill_partitioned(3, 4, 5)
+            .unwrap();
+        assert_eq!(batch[0].1.uri, "at://did:plc:priority/app.bsky.feed.post/1");
     }
 
     #[test]
     fn test_label_live_queue() {
         let (storage, _dir) = setup_test_storage();
-
         let event = LabelEvent {
-            seq: 789,
+            seq: 1,
             labels: vec![Label {
                 src: "did:plc:labeler".to_owned(),
-                uri: "at://did:plc:test/app.bsky.feed.post/123".to_owned(),
+                uri: "at://did:plc:test/app.bsky.feed.post/1".to_owned(),
                 cid: None,
                 val: "spam".to_owned(),
                 neg: false,
@@ -1491,171 +1007,136 @@ mod tests {
                 exp: None,
             }],
         };
-
         storage.enqueue_label_live(&event).unwrap();
-        let (key, retrieved) = storage.dequeue_label_live().unwrap().unwrap();
-
-        assert_eq!(retrieved.seq, event.seq);
-        assert_eq!(retrieved.labels.len(), 1);
-
-        storage.remove_label_live(&key).unwrap();
+        assert_eq!(storage.label_live_len().unwrap(), 1);
+        let (_, retrieved) = storage.dequeue_label_live().unwrap().unwrap();
+        assert_eq!(retrieved.labels[0].val, "spam");
         assert!(storage.dequeue_label_live().unwrap().is_none());
     }
 
     #[test]
     fn test_cursor() {
         let (storage, _dir) = setup_test_storage();
-
-        assert!(storage.get_cursor("test").unwrap().is_none());
-
-        storage.set_cursor("test", 42).unwrap();
-        assert_eq!(storage.get_cursor("test").unwrap(), Some(42));
-
-        storage.set_cursor("test", 100).unwrap();
-        assert_eq!(storage.get_cursor("test").unwrap(), Some(100));
+        assert_eq!(storage.get_cursor("firehose").unwrap(), None);
+        storage.set_cursor("firehose", 42).unwrap();
+        assert_eq!(storage.get_cursor("firehose").unwrap(), Some(42));
+        storage.set_cursor("firehose", -7).unwrap();
+        assert_eq!(storage.get_cursor("firehose").unwrap(), Some(-7));
+        storage.set_cursor("labels", 1).unwrap();
+        assert_eq!(storage.get_cursor("labels").unwrap(), Some(1));
     }
 
     #[test]
     fn test_delete_cursor() {
         let (storage, _dir) = setup_test_storage();
-
-        storage.set_cursor("test_delete", 42).unwrap();
-        assert_eq!(storage.get_cursor("test_delete").unwrap(), Some(42));
-
-        storage.delete_cursor("test_delete").unwrap();
-        assert!(storage.get_cursor("test_delete").unwrap().is_none());
+        storage.set_cursor("c", 5).unwrap();
+        assert_eq!(storage.get_cursor("c").unwrap(), Some(5));
+        storage.delete_cursor("c").unwrap();
+        assert_eq!(storage.get_cursor("c").unwrap(), None);
+        storage.delete_cursor("missing").unwrap();
     }
 
     #[test]
     fn test_is_storage_corrupted() {
-        // Test that is_storage_corrupted returns true for Storage errors with corruption indicators
-        let poisoned_err: WintermuteError = fjall::Error::Poisoned.into();
-        assert!(
-            poisoned_err.is_storage_corrupted(),
-            "Poisoned should be detected"
-        );
-
-        // Test JournalRecovery error (simulated via io error that wraps into JournalRecovery)
-        let io_err = std::io::Error::other("journal issue");
-        let storage_err: WintermuteError = fjall::Error::Io(io_err).into();
-        // IO errors are not corruption
-        assert!(
-            !storage_err.is_storage_corrupted(),
-            "IO errors should not be detected as corruption"
-        );
-
-        // Test non-corruption errors
-        let other_err = WintermuteError::Other("some error".to_owned());
-        assert!(
-            !other_err.is_storage_corrupted(),
-            "Other errors should not be detected as corruption"
-        );
-
-        let serial_err = WintermuteError::Serialization("bad data".to_owned());
-        assert!(
-            !serial_err.is_storage_corrupted(),
-            "Serialization errors should not be detected as corruption"
-        );
+        let corrupt = WintermuteError::Storage("segment corrupt beyond repair".to_owned());
+        assert!(corrupt.is_storage_corrupted());
+        let io: WintermuteError = std::io::Error::other("disk").into();
+        assert!(!io.is_storage_corrupted());
+        assert!(!WintermuteError::Other("x".to_owned()).is_storage_corrupted());
+        assert!(!WintermuteError::Serialization("x".to_owned()).is_storage_corrupted());
     }
 
     #[test]
-    fn test_storage_recovery_from_corruption() {
-        // Test that Storage::new successfully creates fresh storage after first open fails
-        // We can't easily simulate fjall corruption, but we can test the happy path
+    fn test_storage_reopen_preserves_state() {
         let temp_dir = TempDir::with_prefix("storage_recovery_test_").unwrap();
         let db_path = temp_dir.path().join("test_db");
 
-        // First creation should succeed
         let storage = Storage::new(Some(db_path.clone())).unwrap();
         storage.set_cursor("test", 42).unwrap();
+        storage
+            .enqueue_backfill(&backfill_job("did:plc:queued", false))
+            .unwrap();
+        storage
+            .enqueue_firehose_backfill(&index_job("at://did:plc:a/app.bsky.feed.post/1"))
+            .unwrap();
         drop(storage);
 
-        // Second creation should also succeed (reopen)
-        let storage2 = Storage::new(Some(db_path)).unwrap();
+        let storage = Storage::new(Some(db_path)).unwrap();
+        assert_eq!(storage.get_cursor("test").unwrap(), Some(42));
+        assert_eq!(storage.repo_backfill_len().unwrap(), 1);
+        assert_eq!(storage.firehose_backfill_len().unwrap(), 1);
         assert_eq!(
-            storage2.get_cursor("test").unwrap(),
-            Some(42),
-            "should preserve data on reopen"
+            storage.dequeue_backfill().unwrap().unwrap().1.did,
+            "did:plc:queued"
         );
     }
 
     #[test]
     fn test_remove_backfill_by_did() {
         let (storage, _dir) = setup_test_storage();
+        storage
+            .enqueue_backfill(&backfill_job("did:plc:keep1", false))
+            .unwrap();
+        storage
+            .enqueue_backfill(&backfill_job("did:plc:remove", false))
+            .unwrap();
+        storage
+            .enqueue_backfill_priority(&backfill_job("did:plc:remove", true))
+            .unwrap();
+        storage
+            .enqueue_backfill(&backfill_job("did:plc:keep2", false))
+            .unwrap();
+        assert_eq!(storage.repo_backfill_len().unwrap(), 4);
 
-        // Enqueue multiple DIDs
-        let job1 = BackfillJob {
-            did: "did:plc:target".to_owned(),
-            retry_count: 0,
-            priority: false,
-        };
-        let job2 = BackfillJob {
-            did: "did:plc:other".to_owned(),
-            retry_count: 0,
-            priority: false,
-        };
-        let job3 = BackfillJob {
-            did: "did:plc:target".to_owned(),
-            retry_count: 1,
-            priority: true,
-        };
+        assert_eq!(storage.remove_backfill_by_did("did:plc:remove").unwrap(), 2);
+        assert_eq!(storage.repo_backfill_len().unwrap(), 2);
+        // Removing again finds nothing new.
+        assert_eq!(storage.remove_backfill_by_did("did:plc:remove").unwrap(), 0);
 
-        storage.enqueue_backfill(&job1).unwrap();
-        storage.enqueue_backfill(&job2).unwrap();
-        storage.enqueue_backfill_priority(&job3).unwrap();
+        let peeked: Vec<String> = storage
+            .peek_backfill(10)
+            .unwrap()
+            .into_iter()
+            .map(|(_, j)| j.did)
+            .collect();
+        assert_eq!(peeked, ["did:plc:keep1", "did:plc:keep2"]);
 
-        assert_eq!(storage.repo_backfill_len().unwrap(), 3);
+        let order: Vec<String> = std::iter::from_fn(|| storage.dequeue_backfill().unwrap())
+            .map(|(_, j)| j.did)
+            .collect();
+        assert_eq!(order, ["did:plc:keep1", "did:plc:keep2"]);
 
-        // Remove all entries for target DID
-        let removed = storage.remove_backfill_by_did("did:plc:target").unwrap();
-        assert_eq!(removed, 2, "should remove both entries for target");
-
-        // Only other DID should remain
-        assert_eq!(storage.repo_backfill_len().unwrap(), 1);
-        let (_, remaining) = storage.dequeue_backfill().unwrap().unwrap();
-        assert_eq!(remaining.did, "did:plc:other");
+        // A DID re-enqueued after removal is not swallowed by a stale mark.
+        storage
+            .enqueue_backfill(&backfill_job("did:plc:remove", false))
+            .unwrap();
+        assert_eq!(
+            storage.dequeue_backfill().unwrap().unwrap().1.did,
+            "did:plc:remove"
+        );
     }
 
     #[test]
     fn test_remove_backfill_by_did_not_found() {
         let (storage, _dir) = setup_test_storage();
-
-        let job = BackfillJob {
-            did: "did:plc:existing".to_owned(),
-            retry_count: 0,
-            priority: false,
-        };
-        storage.enqueue_backfill(&job).unwrap();
-
-        let removed = storage
-            .remove_backfill_by_did("did:plc:nonexistent")
+        storage
+            .enqueue_backfill(&backfill_job("did:plc:present", false))
             .unwrap();
-        assert_eq!(removed, 0, "should return 0 when DID not found");
+        assert_eq!(storage.remove_backfill_by_did("did:plc:absent").unwrap(), 0);
         assert_eq!(storage.repo_backfill_len().unwrap(), 1);
     }
 
     #[test]
     fn test_clear_repo_backfill() {
         let (storage, _dir) = setup_test_storage();
-
-        // Enqueue several items
-        for i in 0..10 {
-            let job = BackfillJob {
-                did: format!("did:plc:test{i}"),
-                retry_count: 0,
-                priority: i % 2 == 0,
-            };
-            if i % 2 == 0 {
-                storage.enqueue_backfill_priority(&job).unwrap();
-            } else {
-                storage.enqueue_backfill(&job).unwrap();
-            }
-        }
-
-        assert_eq!(storage.repo_backfill_len().unwrap(), 10);
-
+        storage
+            .enqueue_backfill_priority(&backfill_job("did:plc:p", true))
+            .unwrap();
+        storage
+            .enqueue_backfill(&backfill_job("did:plc:n", false))
+            .unwrap();
+        assert_eq!(storage.repo_backfill_len().unwrap(), 2);
         storage.clear_repo_backfill().unwrap();
-
         assert_eq!(storage.repo_backfill_len().unwrap(), 0);
         assert!(storage.dequeue_backfill().unwrap().is_none());
     }
@@ -1663,32 +1144,18 @@ mod tests {
     #[test]
     fn test_clear_empty_repo_backfill() {
         let (storage, _dir) = setup_test_storage();
-
-        assert_eq!(storage.repo_backfill_len().unwrap(), 0);
         storage.clear_repo_backfill().unwrap();
         assert_eq!(storage.repo_backfill_len().unwrap(), 0);
     }
 
-    fn live_job(uri: &str) -> IndexJob {
-        IndexJob {
-            uri: uri.to_owned(),
-            cid: "cid".to_owned(),
-            action: WriteAction::Create,
-            record: None,
-            indexed_at: "2026-08-01T00:00:00.000Z".to_owned(),
-            rev: "3a".to_owned(),
-            provenance: None,
-        }
-    }
-
     #[test]
-    fn live_seq_read_cursor_persists_across_reopen() {
+    fn live_queue_resumes_after_reopen() {
         let dir = TempDir::with_prefix("wintermute_test_").unwrap();
         let db_path = dir.path().join("test_db");
         let storage = Storage::new(Some(db_path.clone())).unwrap();
         for i in 0..6 {
             storage
-                .enqueue_firehose_live(&live_job(&format!(
+                .enqueue_firehose_live(&index_job(&format!(
                     "at://did:plc:a/app.bsky.feed.post/p{i}"
                 )))
                 .unwrap();
@@ -1697,49 +1164,23 @@ mod tests {
         drop(storage);
 
         let storage = Storage::new(Some(db_path)).unwrap();
+        assert_eq!(storage.firehose_live_len().unwrap(), 2);
         let resumed = storage.dequeue_firehose_live_batch(10).unwrap();
         assert_eq!(
             resumed.len(),
             2,
-            "reopen must resume after the persisted cursor"
+            "reopen must resume after the persisted head"
         );
         assert_eq!(resumed[0].1.uri, "at://did:plc:a/app.bsky.feed.post/p4");
         assert_eq!(resumed[1].1.uri, "at://did:plc:a/app.bsky.feed.post/p5");
-        drop(dir);
-    }
 
-    #[test]
-    fn stale_read_cursor_resets_when_partition_restarts() {
-        let dir = TempDir::with_prefix("wintermute_test_").unwrap();
-        let db_path = dir.path().join("test_db");
-        let storage = Storage::new(Some(db_path.clone())).unwrap();
-        for i in 0..3 {
-            storage
-                .enqueue_firehose_live(&live_job(&format!(
-                    "at://did:plc:a/app.bsky.feed.post/q{i}"
-                )))
-                .unwrap();
-        }
-        assert_eq!(storage.dequeue_firehose_live_batch(10).unwrap().len(), 3);
-        // Simulate the runbook partition wipe: force a cursor far ahead of any
-        // key the recreated partition will produce.
+        // A fully drained queue accepts and delivers new work after reopen.
         storage
-            .cursors
-            .insert(LIVE_SEQ_READ_CURSOR.as_bytes(), 1_000_000u64.to_be_bytes())
+            .enqueue_firehose_live(&index_job("at://did:plc:a/app.bsky.feed.post/fresh"))
             .unwrap();
-        drop(storage);
-
-        let storage = Storage::new(Some(db_path)).unwrap();
-        storage
-            .enqueue_firehose_live(&live_job("at://did:plc:a/app.bsky.feed.post/fresh"))
-            .unwrap();
-        // Fresh key sorts below the stale cursor: first dequeue detects and
-        // resets, second dequeue returns the job.
-        let first = storage.dequeue_firehose_live_batch(10).unwrap();
-        let second = storage.dequeue_firehose_live_batch(10).unwrap();
-        let total = first.len() + second.len();
-        assert_eq!(total, 1, "job behind a stale cursor must not be skipped");
-        drop(dir);
+        let fresh = storage.dequeue_firehose_live_batch(10).unwrap();
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].1.uri, "at://did:plc:a/app.bsky.feed.post/fresh");
     }
 
     #[test]
@@ -1747,7 +1188,7 @@ mod tests {
         let (storage, _dir) = setup_test_storage();
         for i in 0..5 {
             storage
-                .enqueue_firehose_live(&live_job(&format!(
+                .enqueue_firehose_live(&index_job(&format!(
                     "at://did:plc:a/app.bsky.feed.post/r{i}"
                 )))
                 .unwrap();
@@ -1756,43 +1197,16 @@ mod tests {
         assert_eq!(batch.len(), 5);
         for (i, (key, job)) in batch.iter().enumerate() {
             assert_eq!(job.uri, format!("at://did:plc:a/app.bsky.feed.post/r{i}"));
-            assert_eq!(key.len(), 8);
+            assert_eq!(key.len(), 16);
         }
+        assert!(batch.windows(2).all(|w| w[0].0 < w[1].0));
         storage
-            .enqueue_firehose_live(&live_job("at://did:plc:a/app.bsky.feed.post/r5"))
+            .enqueue_firehose_live(&index_job("at://did:plc:a/app.bsky.feed.post/r5"))
             .unwrap();
         let next = storage.dequeue_firehose_live_batch(10).unwrap();
         assert_eq!(next.len(), 1);
         assert_eq!(next[0].1.uri, "at://did:plc:a/app.bsky.feed.post/r5");
         assert!(storage.dequeue_firehose_live_batch(10).unwrap().is_empty());
-    }
-
-    #[test]
-    fn live_queue_drains_legacy_partition_first() {
-        let (storage, _dir) = setup_test_storage();
-        for i in 0..3 {
-            let job = live_job(&format!("at://did:plc:legacy/app.bsky.feed.post/l{i}"));
-            let mut value = Vec::new();
-            ciborium::into_writer(&job, &mut value).unwrap();
-            storage
-                .firehose_live
-                .insert(format!("{}:{i}", job.uri).as_bytes(), value.as_slice())
-                .unwrap();
-        }
-        storage
-            .enqueue_firehose_live(&live_job("at://did:plc:new/app.bsky.feed.post/n0"))
-            .unwrap();
-        assert_eq!(storage.firehose_live_len().unwrap(), 4);
-
-        let first = storage.dequeue_firehose_live_batch(10).unwrap();
-        assert_eq!(first.len(), 3);
-        assert!(first.iter().all(|(_, j)| j.uri.contains("did:plc:legacy")));
-
-        let second = storage.dequeue_firehose_live_batch(10).unwrap();
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].1.uri, "at://did:plc:new/app.bsky.feed.post/n0");
-        assert!(storage.legacy_live_drained.load(Ordering::Relaxed));
-        assert_eq!(storage.firehose_live_len().unwrap(), 0);
     }
 
     #[test]
@@ -1802,17 +1216,52 @@ mod tests {
         {
             let storage = Storage::new(Some(db_path.clone())).unwrap();
             storage
-                .enqueue_firehose_live(&live_job("at://did:plc:a/app.bsky.feed.post/first"))
+                .enqueue_firehose_live(&index_job("at://did:plc:a/app.bsky.feed.post/first"))
                 .unwrap();
         }
         let storage = Storage::new(Some(db_path)).unwrap();
         storage
-            .enqueue_firehose_live(&live_job("at://did:plc:a/app.bsky.feed.post/second"))
+            .enqueue_firehose_live(&index_job("at://did:plc:a/app.bsky.feed.post/second"))
             .unwrap();
         let batch = storage.dequeue_firehose_live_batch(10).unwrap();
         assert_eq!(batch.len(), 2);
         assert_eq!(batch[0].1.uri, "at://did:plc:a/app.bsky.feed.post/first");
         assert_eq!(batch[1].1.uri, "at://did:plc:a/app.bsky.feed.post/second");
         assert!(batch[0].0 < batch[1].0);
+    }
+
+    #[test]
+    fn drained_live_queue_holds_no_dead_data() {
+        // The property the Fjall generation swap existed to restore: after a
+        // full drain, nothing of the drained jobs remains on disk.
+        let dir = TempDir::with_prefix("wintermute_test_").unwrap();
+        let db_path = dir.path().join("test_db");
+        let storage = Storage::new(Some(db_path.clone())).unwrap();
+        for i in 0..500 {
+            storage
+                .enqueue_firehose_live(&index_job(&format!(
+                    "at://did:plc:a/app.bsky.feed.post/t{i}"
+                )))
+                .unwrap();
+        }
+        assert_eq!(storage.dequeue_firehose_live_batch(500).unwrap().len(), 500);
+        assert_eq!(storage.firehose_live_approx_len(), 0);
+        drop(storage);
+
+        let live_dir = db_path.join("firehose_live");
+        let bytes: u64 = std::fs::read_dir(&live_dir)
+            .unwrap()
+            .map(|e| e.unwrap().metadata().unwrap().len())
+            .sum();
+        // Only the head file and the (empty or near-empty) current segment.
+        assert!(bytes < 1024, "drained queue still holds {bytes} bytes");
+
+        let storage = Storage::new(Some(db_path)).unwrap();
+        assert!(
+            storage
+                .dequeue_firehose_live_batch(1000)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

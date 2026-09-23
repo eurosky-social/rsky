@@ -16,6 +16,11 @@ mod backfiller_tests {
         (storage, temp_dir)
     }
 
+    /// Serializes tests that read or mutate the global `crate::SHUTDOWN` flag.
+    /// Tests run in parallel in one process, so a test flipping the flag would
+    /// otherwise tear down pipelines started by concurrently running tests.
+    static SHUTDOWN_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     #[test]
     fn test_convert_record_preserves_objects() {
         let input = json!({"text": "hello", "nested": {"key": "value"}});
@@ -411,6 +416,7 @@ mod backfiller_tests {
     fn test_run_creates_runtime() {
         use std::sync::Arc;
 
+        let _shutdown_guard = SHUTDOWN_LOCK.blocking_lock();
         let (storage, _dir) = setup_test_storage();
         let manager = BackfillerManager::new(Arc::new(storage)).unwrap();
 
@@ -430,6 +436,7 @@ mod backfiller_tests {
     async fn test_process_loop_exits_on_shutdown() {
         use std::sync::Arc;
 
+        let _shutdown_guard = SHUTDOWN_LOCK.lock().await;
         let (storage, _dir) = setup_test_storage();
         let manager = BackfillerManager::new(Arc::new(storage)).unwrap();
 
@@ -449,6 +456,7 @@ mod backfiller_tests {
         use std::sync::Arc;
         use std::time::Duration;
 
+        let _shutdown_guard = SHUTDOWN_LOCK.lock().await;
         let (storage, _dir) = setup_test_storage();
         let manager = BackfillerManager::new(Arc::new(storage)).unwrap();
 
@@ -545,5 +553,259 @@ mod backfiller_tests {
 
         // HTTP client should be configured with timeout
         // We can't directly test the timeout config, but we know it was created
+    }
+
+    // =========================================================================
+    // Pipeline stall regression tests
+    //
+    // The continuous pipeline in `run_pipeline` historically had two silent
+    // total-stall modes (seen in production as a repo_backfill queue frozen at
+    // 127K for days):
+    //
+    //   1. Workers wedged on an upstream that accepts the connection but never
+    //      responds: the bounded channel filled, the dequeue task blocked
+    //      forever in `tx.send()`, and the queue froze.
+    //   2. A panic in job processing (e.g. rsky_repo parsing a malformed repo)
+    //      permanently killed a worker task; workers were never revived, so
+    //      after N panics the pipeline was dead while the process stayed
+    //      "healthy".
+    //
+    // Both are now fixed by the per-job timeout + panic containment in the
+    // worker loop, which route wedged/panicking jobs into the existing
+    // retry/dead-letter path. These tests assert the FIXED behavior: the
+    // queue always drains and the pipeline keeps making progress. If either
+    // regresses, they fail by timing out waiting for the drain.
+    // =========================================================================
+
+    use crate::backfiller::{JobFuture, JobHandler};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::time::{Duration, Instant};
+
+    /// TCP server that accepts connections and never responds, wedging any
+    /// HTTP client on it until the client-side timeout (120s in production).
+    /// Returns the endpoint and a counter of accepted connections: a truly
+    /// wedged worker never opens a second connection, while a worker that
+    /// times out and retries keeps opening new ones.
+    fn spawn_hang_server() -> (String, Arc<AtomicUsize>) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let connections_srv = Arc::clone(&connections);
+        std::thread::spawn(move || {
+            while let Ok((stream, _)) = listener.accept() {
+                connections_srv.fetch_add(1, AtomicOrdering::Relaxed);
+                // Keep the socket open forever without responding.
+                std::mem::forget(stream);
+            }
+        });
+        (format!("http://{addr}"), connections)
+    }
+
+    /// Polls `probe` every 100ms until it returns true or the deadline passes.
+    /// Returns the final probe result.
+    async fn wait_for(deadline: Duration, mut probe: impl FnMut() -> bool) -> bool {
+        let end = Instant::now() + deadline;
+        while Instant::now() < end {
+            if probe() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        probe()
+    }
+
+    /// Regression test for stall mode 1: workers wedged on unresponsive
+    /// upstreams must recover via the per-job timeout.
+    ///
+    /// Uses the REAL `process_loop` and `process_job`. The PDS cache is
+    /// pre-populated so no DID resolution happens; every repo fetch goes to a
+    /// server that accepts and never responds (the HTTP client's own timeout
+    /// is far beyond the test window, so only the job timeout can save the
+    /// workers). Each attempt must time out, retry twice, and dead-letter,
+    /// fully draining the queue. Before the fix, workers hung, the channel
+    /// filled, the dequeue task blocked, and the queue froze forever.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_pipeline_recovers_from_wedged_workers() {
+        const JOBS: usize = 6;
+
+        // These tests need SHUTDOWN to stay false for their whole duration.
+        let _shutdown_guard = SHUTDOWN_LOCK.lock().await;
+        let (storage, _dir) = setup_test_storage();
+        let storage = Arc::new(storage);
+        let (endpoint, connections) = spawn_hang_server();
+
+        let pds_cache = Arc::new(dashmap::DashMap::new());
+        for i in 0..JOBS {
+            let did = format!("did:plc:wedge{i:03}");
+            pds_cache.insert(did.clone(), endpoint.clone());
+            storage
+                .enqueue_backfill(&BackfillJob {
+                    did,
+                    retry_count: 0,
+                    priority: false,
+                })
+                .unwrap();
+        }
+        assert_eq!(storage.repo_backfill_len().unwrap(), JOBS);
+
+        let manager = BackfillerManager {
+            workers: 2,
+            storage: Arc::clone(&storage),
+            // PERMISSIVE so the loopback hang server is reachable; the client
+            // timeout is far beyond the test window, so recovery must come
+            // from the pipeline's job timeout, not from the transport.
+            http_client: rsky_identity::safe_fetch::SafeClient::new(
+                rsky_identity::safe_fetch::NetworkPolicy::PERMISSIVE,
+                Duration::from_secs(120),
+            )
+            .unwrap(),
+            pds_cache,
+            generations: None,
+            // Short job timeout so the 18 attempts (6 jobs x 3 tries) finish
+            // quickly; production uses backfiller_job_timeout().
+            job_timeout: Duration::from_millis(300),
+        };
+
+        let pipeline = tokio::spawn(async move { manager.process_loop().await });
+
+        // Every attempt (6 jobs x 3 tries) opens a fresh upstream connection.
+        // 18 attempts / 2 workers x 300ms ~= 3s; allow generous slack. Before
+        // the fix, the count froze at one connection per worker (2).
+        // Note: queue length alone is NOT a progress signal here -- the
+        // dequeue task empties Fjall into the channel without processing.
+        let all_attempted = wait_for(Duration::from_secs(30), || {
+            connections.load(AtomicOrdering::Relaxed) >= JOBS * 3
+        })
+        .await;
+        assert!(
+            all_attempted,
+            "expected {} upstream connection attempts, got {} -- workers are \
+             not recovering from wedged requests",
+            JOBS * 3,
+            connections.load(AtomicOrdering::Relaxed)
+        );
+
+        // Once the final attempts time out and dead-letter, the queue must be
+        // fully drained: no strays, no unfinished retries.
+        let drained = wait_for(Duration::from_secs(10), || {
+            storage.repo_backfill_len().unwrap() == 0
+        })
+        .await;
+        assert!(
+            drained,
+            "queue should fully drain once all attempts are dead-lettered"
+        );
+
+        // The pipeline survives: it idles on the empty queue, ready for more.
+        assert!(
+            !pipeline.is_finished(),
+            "pipeline should stay alive after draining the queue"
+        );
+
+        pipeline.abort();
+    }
+
+    /// Regression test for stall mode 2: a panic in job processing must be
+    /// contained -- the job fails into the retry/dead-letter path and the
+    /// worker survives to process the next job.
+    ///
+    /// Uses the real `run_pipeline` with an injected handler that panics on
+    /// every job (the production equivalent is a panic inside rsky_repo
+    /// CAR/MST parsing on a malformed repo). Every job must be attempted
+    /// 3 times (initial + 2 retries) and dead-lettered, fully draining the
+    /// queue. Before the fix, each worker died on its first panic and the
+    /// pipeline froze with the queue still full.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_pipeline_survives_worker_panics() {
+        const JOBS: usize = 6;
+
+        // These tests need SHUTDOWN to stay false for their whole duration.
+        let _shutdown_guard = SHUTDOWN_LOCK.lock().await;
+        let (storage, _dir) = setup_test_storage();
+        let storage = Arc::new(storage);
+
+        for i in 0..JOBS {
+            storage
+                .enqueue_backfill(&BackfillJob {
+                    did: format!("did:plc:poison{i:03}"),
+                    retry_count: 0,
+                    priority: false,
+                })
+                .unwrap();
+        }
+        assert_eq!(storage.repo_backfill_len().unwrap(), JOBS);
+
+        let manager = BackfillerManager {
+            workers: 2,
+            storage: Arc::clone(&storage),
+            http_client: rsky_identity::safe_fetch::SafeClient::new(
+                rsky_identity::safe_fetch::NetworkPolicy::PERMISSIVE,
+                Duration::from_secs(30),
+            )
+            .unwrap(),
+            pds_cache: Arc::new(dashmap::DashMap::new()),
+            generations: None,
+            job_timeout: Duration::from_secs(30),
+        };
+
+        // Handler that panics on every job, simulating a poison repo.
+        // Counts invocations: surviving workers keep processing, so every
+        // job gets its full 3 attempts.
+        let handler_calls = Arc::new(AtomicUsize::new(0));
+        let handler: Arc<JobHandler> = {
+            let handler_calls = Arc::clone(&handler_calls);
+            Arc::new(move |job: BackfillJob| -> JobFuture {
+                let handler_calls = Arc::clone(&handler_calls);
+                Box::pin(async move {
+                    handler_calls.fetch_add(1, AtomicOrdering::Relaxed);
+                    panic!("simulated poison repo panic for {}", job.did);
+                })
+            })
+        };
+
+        let pipeline = tokio::spawn(async move { manager.run_pipeline(&handler).await });
+
+        // Surviving workers must keep processing: every job gets its full
+        // retry budget of 3 attempts. Before the fix, each worker died on its
+        // first panic and the count froze at 2.
+        let all_attempted = wait_for(Duration::from_secs(30), || {
+            handler_calls.load(AtomicOrdering::Relaxed) >= JOBS * 3
+        })
+        .await;
+        assert!(
+            all_attempted,
+            "expected {} handler invocations, got {} -- workers did not \
+             survive the panics",
+            JOBS * 3,
+            handler_calls.load(AtomicOrdering::Relaxed)
+        );
+
+        // Dead-lettering caps every job at exactly 3 attempts.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let calls = handler_calls.load(AtomicOrdering::Relaxed);
+        assert_eq!(
+            calls,
+            JOBS * 3,
+            "jobs were attempted more than 3 times -- dead-lettering regressed"
+        );
+
+        // Once everything is dead-lettered the queue must be fully drained.
+        let drained = wait_for(Duration::from_secs(10), || {
+            storage.repo_backfill_len().unwrap() == 0
+        })
+        .await;
+        assert!(
+            drained,
+            "queue should fully drain once all attempts are dead-lettered"
+        );
+
+        // The pipeline survives the panics: it idles on the empty queue.
+        assert!(
+            !pipeline.is_finished(),
+            "pipeline should stay alive after containing worker panics"
+        );
+
+        pipeline.abort();
     }
 }
