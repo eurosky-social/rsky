@@ -43,6 +43,7 @@ pub mod indexer;
 pub mod ingester;
 pub mod metrics;
 pub mod outbound;
+pub mod queue_log;
 pub mod reconcile;
 pub mod storage;
 pub mod types;

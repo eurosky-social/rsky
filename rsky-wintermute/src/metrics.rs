@@ -59,7 +59,7 @@ pub static INGESTER_FIREHOSE_FILTERED_OPERATIONS_TOTAL: LazyLock<IntCounter> =
         .unwrap()
     });
 
-/// Stream lengths (Redis/fjall queue lengths)
+/// Queue lengths
 pub static INGESTER_FIREHOSE_LIVE_LENGTH: LazyLock<IntGauge> = LazyLock::new(|| {
     register_int_gauge!(
         "ingester_firehose_live_length",
@@ -180,7 +180,7 @@ pub static INGESTER_BACKFILL_CURSOR_SKIPS_TOTAL: LazyLock<IntCounter> = LazyLock
 pub static INGESTER_BACKFILL_CURSOR_RESET_TOTAL: LazyLock<IntCounter> = LazyLock::new(|| {
     register_int_counter!(
         "ingester_backfill_cursor_reset_total",
-        "Total number of cursor resets due to Fjall data loss detection"
+        "Total number of cursor resets due to local storage data loss detection"
     )
     .unwrap()
 });

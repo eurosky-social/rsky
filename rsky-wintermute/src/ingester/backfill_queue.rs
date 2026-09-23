@@ -22,28 +22,28 @@ struct RepoRef {
 /// Cursor storage abstraction for testing
 enum CursorStore<'a> {
     Postgres(&'a Pool),
-    Fjall(&'a Storage),
+    Local(&'a Storage),
 }
 
 impl CursorStore<'_> {
     async fn get(&self, key: &str) -> Result<Option<i64>, WintermuteError> {
         match self {
             CursorStore::Postgres(pool) => get_cursor_from_postgres(pool, key).await,
-            CursorStore::Fjall(storage) => Ok(storage.get_cursor(key)?),
+            CursorStore::Local(storage) => Ok(storage.get_cursor(key)?),
         }
     }
 
     async fn set(&self, key: &str, cursor: i64) -> Result<(), WintermuteError> {
         match self {
             CursorStore::Postgres(pool) => set_cursor_in_postgres(pool, key, cursor).await,
-            CursorStore::Fjall(storage) => storage.set_cursor(key, cursor),
+            CursorStore::Local(storage) => storage.set_cursor(key, cursor),
         }
     }
 
     async fn delete(&self, key: &str) -> Result<(), WintermuteError> {
         match self {
             CursorStore::Postgres(pool) => delete_cursor_from_postgres(pool, key).await,
-            CursorStore::Fjall(storage) => storage.delete_cursor(key),
+            CursorStore::Local(storage) => storage.delete_cursor(key),
         }
     }
 }
@@ -76,7 +76,7 @@ pub async fn populate_backfill_queue(
 
     let cursor_store = pool
         .as_ref()
-        .map_or_else(|| CursorStore::Fjall(&storage), CursorStore::Postgres);
+        .map_or_else(|| CursorStore::Local(&storage), CursorStore::Postgres);
 
     let http_client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
@@ -84,16 +84,16 @@ pub async fn populate_backfill_queue(
 
     let cursor_key = format!("backfill_enum:{relay_host}");
 
-    // Get cursor from cursor store (postgres survives Fjall corruption)
+    // Get cursor from cursor store (postgres survives local storage loss)
     let stored_cursor = cursor_store.get(&cursor_key).await?;
 
-    // Check if Fjall was lost: cursor exists but repo_backfill queue is empty
+    // Check if local storage was lost: cursor exists but repo_backfill queue is empty
     // This means DIDs were enumerated but the queue data was lost
     let repo_backfill_len = storage.repo_backfill_len().unwrap_or(0);
     let mut cursor = if let Some(stored) = stored_cursor {
         if stored > 0 && repo_backfill_len == 0 {
             tracing::warn!(
-                "detected Fjall data loss: cursor at {} but repo_backfill queue is empty, resetting to re-enumerate from beginning",
+                "detected local storage data loss: cursor at {} but repo_backfill queue is empty, resetting to re-enumerate from beginning",
                 stored
             );
             metrics::INGESTER_BACKFILL_CURSOR_RESET_TOTAL.inc();
@@ -160,7 +160,7 @@ pub async fn populate_backfill_queue(
         }
 
         if let Some(next_cursor) = list_response.cursor {
-            // Store cursor (survives Fjall corruption when using postgres)
+            // Store cursor (survives local storage loss when using postgres)
             cursor_store
                 .set(&cursor_key, next_cursor.parse::<i64>().unwrap_or(0))
                 .await?;

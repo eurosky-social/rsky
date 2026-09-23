@@ -7,32 +7,18 @@ pub const CAPACITY_INDEX: usize = 1 << 14;
 
 pub const WORKERS_INGESTER: usize = 4;
 
-// Fjall storage config - tunable via environment variables
-// On high-memory servers (200GB+ RAM), these should be increased significantly
-// Rule of thumb: CACHE_SIZE = 20-25% of RAM, WRITE_BUFFER_SIZE = 1-2% of RAM
-pub static CACHE_SIZE: LazyLock<u64> = LazyLock::new(|| {
-    std::env::var("FJALL_CACHE_SIZE_GB")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map_or(32 * 1024 * 1024 * 1024, |gb| gb * 1024 * 1024 * 1024) // Default: 32GB
-});
-
-pub static WRITE_BUFFER_SIZE: LazyLock<u64> = LazyLock::new(|| {
-    std::env::var("FJALL_WRITE_BUFFER_SIZE_GB")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .map_or(2 * 1024 * 1024 * 1024, |gb| gb * 1024 * 1024 * 1024) // Default: 2GB
-});
-
-pub const FSYNC_MS: Option<u16> = Some(1000);
-pub const MEMTABLE_SIZE: u32 = 256 * 1024 * 1024; // 256MB (up from 64MB)
-pub const BLOCK_SIZE: u32 = 64 * 1024;
+// Queue storage config. The FIFO queues (firehose_live, label_live) are
+// segmented append-only logs; the rest live in LMDB.
+/// Appends are fsynced at most this often (also on segment roll and close).
+pub const QUEUE_LOG_FSYNC_MS: u64 = 1000;
+/// Segment size at which the queue log rolls to a new file. Consumed
+/// segments are unlinked whole, so this bounds the reclaim granularity.
+pub const QUEUE_LOG_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
 
 pub const FIREHOSE_PING_INTERVAL: Duration = Duration::from_secs(30);
 
 // Cursor save interval - like indigo/tap's cursorSaveInterval
-// Saves cursor to Fjall/Postgres periodically instead of every event
-// This prevents Fjall poisoning from high-frequency writes
+// Saves cursor to storage/Postgres periodically instead of every event
 pub static CURSOR_SAVE_INTERVAL: LazyLock<Duration> = LazyLock::new(|| {
     let secs = std::env::var("CURSOR_SAVE_INTERVAL_SECS")
         .ok()
@@ -356,12 +342,11 @@ pub fn create_pg_pool(
         .map_err(|e| WintermuteError::Other(format!("pool creation failed: {e}")))
 }
 
-// Backfiller direct write mode - bypass Fjall queue and write directly to PostgreSQL
-// This eliminates the Fjall dequeue bottleneck (~3.5s per batch) for backfill operations
+// Backfiller direct write mode - bypass the firehose_backfill queue and write directly to PostgreSQL
 pub static BACKFILLER_DIRECT_WRITE: LazyLock<bool> = LazyLock::new(|| {
     std::env::var("BACKFILLER_DIRECT_WRITE")
         .ok()
-        .is_none_or(|s| s == "true" || s == "1") // Default: enabled (bypass Fjall)
+        .is_none_or(|s| s == "true" || s == "1") // Default: enabled (bypass the queue)
 });
 
 // Backfiller DB pool size - separate from main pool for direct write mode
