@@ -1,5 +1,8 @@
 name: Rust CI
 
+# Only runs in blacksky's repository. Forks skip every job here (the root
+# jobs are gated, so their dependents are skipped too) and carry their own
+# copy of this workflow instead; see eurosky-ci.yml for the eurosky fork.
 on:
   push:
     branches: [main]
@@ -46,6 +49,7 @@ jobs:
   # First determine which workspace members need to be processed
   determine-workspace-members:
     runs-on: ubuntu-latest
+    if: github.repository == 'blacksky-algorithms/rsky'
     outputs:
       workspace_members: ${{ steps.set-members.outputs.workspace_members }}
     steps:
@@ -69,6 +73,7 @@ jobs:
   # Determine which Dockerfiles need to be processed
   determine-dockerfiles:
     runs-on: ubuntu-latest
+    if: github.repository == 'blacksky-algorithms/rsky'
     outputs:
       dockerfiles: ${{ steps.set-dockerfiles.outputs.dockerfiles }}
       is_fork: ${{ steps.set-dockerfiles.outputs.is_fork }}
@@ -243,6 +248,7 @@ jobs:
   # Run formatting check on the entire workspace
   formatting:
     runs-on: ubuntu-latest
+    if: github.repository == 'blacksky-algorithms/rsky'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -361,7 +367,7 @@ jobs:
   ci-success:
     runs-on: ubuntu-latest
     needs: [check, build-and-test, coverage-pds, formatting, determine-dockerfiles]
-    if: always()
+    if: always() && github.repository == 'blacksky-algorithms/rsky'
     steps:
       - name: Check if docker-build should run
         id: should-docker-build
