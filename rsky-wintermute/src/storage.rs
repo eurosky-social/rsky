@@ -20,7 +20,7 @@
 //! firehose_events/<seq>.cbor     one file per event (no production caller)
 //! ```
 
-use crate::config::{QUEUE_LOG_FSYNC_MS, QUEUE_LOG_SEGMENT_BYTES};
+use crate::config::{QUEUE_LOG_FSYNC_MS, QUEUE_LOG_RECLAIM_BYTES, QUEUE_LOG_SEGMENT_BYTES};
 use crate::queue_log::SegmentedLog;
 use crate::types::{BackfillJob, FirehoseEvent, IndexJob, LabelEvent, WintermuteError};
 use std::collections::HashMap;
@@ -43,6 +43,7 @@ fn open_log(dir: PathBuf) -> Result<SegmentedLog, WintermuteError> {
     Ok(SegmentedLog::open(
         dir,
         QUEUE_LOG_SEGMENT_BYTES,
+        QUEUE_LOG_RECLAIM_BYTES,
         Duration::from_millis(QUEUE_LOG_FSYNC_MS),
     )?)
 }
@@ -301,9 +302,10 @@ impl Storage {
     fn open_db(path: &Path) -> Result<Self, WintermuteError> {
         std::fs::create_dir_all(path)?;
         tracing::info!(
-            "opening queue logs at {} (segment={}MB, fsync={}ms, backfill shards={})",
+            "opening queue logs at {} (segment={}MB, reclaim={}MB, fsync={}ms, backfill shards={})",
             path.display(),
             QUEUE_LOG_SEGMENT_BYTES / (1024 * 1024),
+            QUEUE_LOG_RECLAIM_BYTES / (1024 * 1024),
             QUEUE_LOG_FSYNC_MS,
             BACKFILL_SHARDS
         );
@@ -1233,7 +1235,7 @@ mod tests {
     #[test]
     fn drained_live_queue_holds_no_dead_data() {
         // The property the Fjall generation swap existed to restore: after a
-        // full drain, nothing of the drained jobs remains on disk.
+        // full drain, drained jobs occupy at most the reclaim threshold.
         let dir = TempDir::with_prefix("wintermute_test_").unwrap();
         let db_path = dir.path().join("test_db");
         let storage = Storage::new(Some(db_path.clone())).unwrap();
@@ -1253,8 +1255,11 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().metadata().unwrap().len())
             .sum();
-        // Only the head file and the (empty or near-empty) current segment.
-        assert!(bytes < 1024, "drained queue still holds {bytes} bytes");
+        // The marks plus a current segment below the reclaim threshold.
+        assert!(
+            bytes < crate::config::QUEUE_LOG_RECLAIM_BYTES + 1024,
+            "drained queue still holds {bytes} bytes"
+        );
 
         let storage = Storage::new(Some(db_path)).unwrap();
         assert!(

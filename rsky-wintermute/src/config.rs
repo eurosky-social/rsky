@@ -7,13 +7,20 @@ pub const CAPACITY_INDEX: usize = 1 << 14;
 
 pub const WORKERS_INGESTER: usize = 4;
 
-// Queue storage config. The FIFO queues (firehose_live, label_live) are
-// segmented append-only logs; the rest live in LMDB.
+// Queue storage config. Every queue is a segmented append-only log
+// (src/queue_log.rs).
 /// Appends are fsynced at most this often (also on segment roll and close).
 pub const QUEUE_LOG_FSYNC_MS: u64 = 1000;
 /// Segment size at which the queue log rolls to a new file. Consumed
 /// segments are unlinked whole, so this bounds the reclaim granularity.
 pub const QUEUE_LOG_SEGMENT_BYTES: u64 = 256 * 1024 * 1024;
+/// Dead bytes a drained log must hold before its segment is reclaimed.
+///
+/// Each reclaim creates and deletes a file, and on a busy disk those wait
+/// behind every in-flight fsync; reclaiming the 240
+/// backfill shards on every drain stalled dequeues by hundreds of ms. Idle
+/// logs keep at most this much dead data each.
+pub const QUEUE_LOG_RECLAIM_BYTES: u64 = 16 * 1024 * 1024;
 
 pub const FIREHOSE_PING_INTERVAL: Duration = Duration::from_secs(30);
 

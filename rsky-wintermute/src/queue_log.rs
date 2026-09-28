@@ -172,6 +172,7 @@ struct Head {
 pub struct SegmentedLog {
     dir: PathBuf,
     segment_bytes: u64,
+    reclaim_bytes: u64,
     fsync_interval: Duration,
     /// Base shared by every mark this process writes.
     epoch: u64,
@@ -331,10 +332,12 @@ fn count_records(dir: &Path, from: Pos, tail: Pos) -> io::Result<u64> {
 impl SegmentedLog {
     /// Opens or creates the log in `dir`. `segment_bytes` is the size at
     /// which the writer rolls to a new segment; segments may overshoot it by
-    /// one record.
+    /// one record. A drained log reclaims its current segment once at least
+    /// `reclaim_bytes` of it are dead.
     pub fn open(
         dir: impl Into<PathBuf>,
         segment_bytes: u64,
+        reclaim_bytes: u64,
         fsync_interval: Duration,
     ) -> io::Result<Self> {
         let dir = dir.into();
@@ -435,6 +438,7 @@ impl SegmentedLog {
         let log = Self {
             dir,
             segment_bytes,
+            reclaim_bytes: reclaim_bytes.max(1),
             fsync_interval,
             epoch,
             writer: Mutex::new(Writer {
@@ -583,7 +587,7 @@ impl SegmentedLog {
         let (records, new_head, skipped) = self.read_records(head.pos, end, limit)?;
         if new_head == head.pos {
             // Retry a reclaim that an earlier drain skipped.
-            if head.pos == end && head.pos.off > 0 {
+            if self.reclaimable(head.pos, end) {
                 self.reclaim_drained(&mut head)?;
             }
             return Ok(records);
@@ -597,7 +601,7 @@ impl SegmentedLog {
             pos: new_head,
             ordinal,
         };
-        if new_head == end && new_head.off > 0 {
+        if self.reclaimable(new_head, end) {
             self.reclaim_drained(&mut head)?;
         }
         if skipped {
@@ -629,9 +633,18 @@ impl SegmentedLog {
         Ok(())
     }
 
+    /// Whether a head at `head` has drained the log up to `end` and left
+    /// enough dead data in the current segment to be worth reclaiming.
+    fn reclaimable(&self, head: Pos, end: Pos) -> bool {
+        // Every byte before the head in its segment is dead.
+        let dead = head.off;
+        head == end && dead >= self.reclaim_bytes
+    }
+
     /// A fully drained log still holds its current segment, every byte of
-    /// it dead. Roll the writer to a fresh segment and unlink the old one,
-    /// so a drained queue occupies no space. Lock order: head, writer,
+    /// it dead. Once that is at least `reclaim_bytes`, roll the writer to a
+    /// fresh segment and unlink the old one, so a drained queue holds less
+    /// than `reclaim_bytes` of dead data. Lock order: head, writer,
     /// committed (append takes writer then committed and never head).
     ///
     /// Only housekeeping, so it never waits for the writer: if an append or
@@ -817,7 +830,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn open(dir: &Path, segment_bytes: u64) -> SegmentedLog {
-        SegmentedLog::open(dir, segment_bytes, Duration::from_secs(1)).unwrap()
+        SegmentedLog::open(dir, segment_bytes, 1, Duration::from_secs(1)).unwrap()
     }
 
     fn payloads(records: &[(Vec<u8>, Vec<u8>)]) -> Vec<String> {
@@ -934,7 +947,7 @@ mod tests {
     /// Never fsyncs on its own, so the checkpoint only moves on open, roll,
     /// explicit sync and a clean drop.
     fn open_manual_sync(dir: &Path, segment_bytes: u64) -> SegmentedLog {
-        SegmentedLog::open(dir, segment_bytes, Duration::from_secs(3600)).unwrap()
+        SegmentedLog::open(dir, segment_bytes, 1, Duration::from_secs(3600)).unwrap()
     }
 
     fn corrupt_payload_byte(dir: &Path, seg: u64, off: u64) {
@@ -1071,10 +1084,35 @@ mod tests {
     }
 
     #[test]
+    fn a_drained_log_keeps_its_segment_until_the_reclaim_threshold() {
+        let dir = TempDir::new().unwrap();
+        // 11-byte records; reclaim once 30 dead bytes have accumulated.
+        let log = SegmentedLog::open(dir.path(), 1 << 20, 30, Duration::from_secs(1)).unwrap();
+        log.append(b"r00").unwrap();
+        log.append(b"r01").unwrap();
+        assert_eq!(log.read_batch(10).unwrap().len(), 2);
+        assert_eq!(list_segments(dir.path()).unwrap(), [0], "22 dead bytes");
+        log.append(b"r02").unwrap();
+        assert_eq!(payloads(&log.read_batch(10).unwrap()), ["r02"]);
+        assert_eq!(list_segments(dir.path()).unwrap(), [1], "33 dead bytes");
+        assert!(log.is_empty());
+        // Reopening a drained, unreclaimed log resumes at the end.
+        log.append(b"r03").unwrap();
+        log.append(b"r04").unwrap();
+        assert_eq!(log.read_batch(1).unwrap().len(), 1);
+        assert_eq!(log.read_batch(1).unwrap().len(), 1);
+        drop(log);
+        let log = SegmentedLog::open(dir.path(), 1 << 20, 30, Duration::from_secs(1)).unwrap();
+        assert!(log.is_empty());
+        log.append(b"r05").unwrap();
+        assert_eq!(payloads(&log.read_batch(10).unwrap()), ["r05"]);
+    }
+
+    #[test]
     fn periodic_sync_moves_the_checkpoint() {
         let dir = TempDir::new().unwrap();
         // Every append is due for a sync.
-        let log = SegmentedLog::open(dir.path(), 1 << 20, Duration::ZERO).unwrap();
+        let log = SegmentedLog::open(dir.path(), 1 << 20, 1, Duration::ZERO).unwrap();
         log.append(b"one").unwrap();
         log.append(b"two").unwrap();
         let c = checkpoint_on_disk(dir.path());
