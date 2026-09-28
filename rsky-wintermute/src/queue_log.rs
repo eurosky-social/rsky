@@ -24,7 +24,8 @@
 //! epoch, so a stale or mismatched mark costs time, never correctness.
 //!
 //! Durability: appends are fsynced at most once per `fsync_interval`, on
-//! segment roll and on drop. The head is rewritten after every read batch
+//! segment roll and on drop. The periodic fsync runs outside the writer
+//! lock, so appends and drains keep going while the disk flushes. The head is rewritten after every read batch
 //! but not synced, so a crash re-delivers at most the batches since the last
 //! head write (at-least-once). A torn record at the tail of the last segment
 //! is truncated on open; a corrupt record elsewhere skips the rest of its
@@ -36,7 +37,7 @@ use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError, TryLockError};
 use std::time::{Duration, Instant};
 
 const RECORD_HEADER: usize = 8;
@@ -145,13 +146,21 @@ fn open_mark_file(path: &Path) -> io::Result<File> {
 }
 
 struct Writer {
-    file: File,
+    /// Shared so a periodic fsync can run after the lock is released.
+    file: Arc<File>,
     /// Next append position.
     pos: Pos,
     /// Records appended before `pos`, in the log's epoch.
     ordinal: u64,
     dirty: bool,
     last_sync: Instant,
+}
+
+/// An fsync claimed under the writer lock, to run after releasing it.
+struct PendingSync {
+    file: Arc<File>,
+    pos: Pos,
+    ordinal: u64,
 }
 
 /// The consumer's position; `ordinal` counts the records before it.
@@ -173,6 +182,9 @@ pub struct SegmentedLog {
     head: Mutex<Head>,
     head_file: File,
     checkpoint_file: File,
+    /// Position in the checkpoint file. Syncs run concurrently and can
+    /// finish out of order; this keeps the checkpoint from moving back.
+    checkpointed: Mutex<Pos>,
     unread: AtomicU64,
 }
 
@@ -426,7 +438,7 @@ impl SegmentedLog {
             fsync_interval,
             epoch,
             writer: Mutex::new(Writer {
-                file: tail_file,
+                file: Arc::new(tail_file),
                 pos: tail,
                 ordinal: tail_ordinal,
                 dirty: false,
@@ -439,20 +451,23 @@ impl SegmentedLog {
             }),
             head_file,
             checkpoint_file,
+            checkpointed: Mutex::new(Pos { seg: 0, off: 0 }),
             unread: AtomicU64::new(unread),
         };
         log.persist_head(head, head_ordinal)?;
         // A checkpoint from another epoch, or past a truncated tail, would
         // force a full rescan on every open until the next periodic sync.
-        let checkpoint_usable = checkpoint.is_some_and(|c| c.epoch == epoch && c.pos <= tail);
-        if !checkpoint_usable {
-            let w = lock(&log.writer);
-            // Earlier segments were synced when the writer rolled past them.
-            if tail.off > 0 {
-                w.file.sync_data()?;
+        match checkpoint {
+            Some(c) if c.epoch == epoch && c.pos <= tail => *lock(&log.checkpointed) = c.pos,
+            _ => {
+                let w = lock(&log.writer);
+                // Earlier segments were synced when the writer rolled past them.
+                if tail.off > 0 {
+                    w.file.sync_data()?;
+                }
+                log.persist_checkpoint(w.pos, w.ordinal)?;
+                drop(w);
             }
-            log.persist_checkpoint(&w)?;
-            drop(w);
         }
         Ok(log)
     }
@@ -466,43 +481,73 @@ impl SegmentedLog {
         self.head_file.write_all_at(&mark.encode(), 0)
     }
 
-    /// Records that everything before the writer's position is durable.
-    /// Call only right after an fsync of the writer's segment.
-    fn persist_checkpoint(&self, w: &Writer) -> io::Result<()> {
+    /// Records that everything before `pos` is durable. Call only after an
+    /// fsync that covered `pos`. An older position than the one already
+    /// recorded is ignored.
+    fn persist_checkpoint(&self, pos: Pos, ordinal: u64) -> io::Result<()> {
+        let mut last = lock(&self.checkpointed);
+        if pos < *last {
+            return Ok(());
+        }
         let mark = Mark {
-            pos: w.pos,
-            ordinal: w.ordinal,
+            pos,
+            ordinal,
             epoch: self.epoch,
         };
-        self.checkpoint_file.write_all_at(&mark.encode(), 0)
+        self.checkpoint_file.write_all_at(&mark.encode(), 0)?;
+        *last = pos;
+        drop(last);
+        Ok(())
     }
 
+    /// Rolls to a new segment once the current one is full. The old
+    /// segment is fsynced under the writer lock, unlike the periodic sync:
+    /// nothing may land in the next segment before the previous one is
+    /// durable, or a crash could leave a hole in the middle of the log.
+    /// Rolls happen once per `segment_bytes`, so the stall is rare.
     fn roll_if_full(&self, w: &mut Writer) -> io::Result<()> {
         if w.pos.off < self.segment_bytes {
             return Ok(());
         }
         w.file.sync_data()?;
-        self.persist_checkpoint(w)?;
+        self.persist_checkpoint(w.pos, w.ordinal)?;
         let next = w.pos.seg + 1;
-        w.file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(segment_path(&self.dir, next))?;
+        w.file = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(segment_path(&self.dir, next))?,
+        );
         w.pos = Pos { seg: next, off: 0 };
         w.dirty = false;
         w.last_sync = Instant::now();
         Ok(())
     }
 
-    fn sync_if_due(&self, w: &mut Writer) -> io::Result<()> {
-        if w.dirty && w.last_sync.elapsed() >= self.fsync_interval {
-            w.file.sync_data()?;
-            self.persist_checkpoint(w)?;
-            w.dirty = false;
-            w.last_sync = Instant::now();
+    /// Claims the periodic fsync if it is due. The caller runs it with
+    /// `run_sync` after releasing the writer lock.
+    fn claim_sync_if_due(&self, w: &mut Writer) -> Option<PendingSync> {
+        if !w.dirty || w.last_sync.elapsed() < self.fsync_interval {
+            return None;
         }
-        Ok(())
+        w.dirty = false;
+        w.last_sync = Instant::now();
+        Some(PendingSync {
+            file: Arc::clone(&w.file),
+            pos: w.pos,
+            ordinal: w.ordinal,
+        })
+    }
+
+    fn run_sync(&self, sync: &PendingSync) -> io::Result<()> {
+        if let Err(e) = sync.file.sync_data() {
+            // Let the next append claim it again. If the writer has rolled
+            // since, the roll already synced this segment.
+            lock(&self.writer).dirty = true;
+            return Err(e);
+        }
+        self.persist_checkpoint(sync.pos, sync.ordinal)
     }
 
     /// Appends one record and returns its key.
@@ -516,12 +561,15 @@ impl SegmentedLog {
         w.pos.off += record.len() as u64;
         w.ordinal += 1;
         w.dirty = true;
-        self.sync_if_due(&mut w)?;
+        let pending = self.claim_sync_if_due(&mut w);
         // Counted before the record becomes readable and under the writer
         // lock, so neither a dequeue nor a recount can see it uncounted.
         self.unread.fetch_add(1, Ordering::Relaxed);
         *lock(&self.committed) = w.pos;
         drop(w);
+        if let Some(sync) = pending {
+            self.run_sync(&sync)?;
+        }
         Ok(pos.to_key())
     }
 
@@ -534,6 +582,10 @@ impl SegmentedLog {
         let end = *lock(&self.committed);
         let (records, new_head, skipped) = self.read_records(head.pos, end, limit)?;
         if new_head == head.pos {
+            // Retry a reclaim that an earlier drain skipped.
+            if head.pos == end && head.pos.off > 0 {
+                self.reclaim_drained(&mut head)?;
+            }
             return Ok(records);
         }
         let ordinal = head.ordinal + records.len() as u64;
@@ -581,8 +633,15 @@ impl SegmentedLog {
     /// it dead. Roll the writer to a fresh segment and unlink the old one,
     /// so a drained queue occupies no space. Lock order: head, writer,
     /// committed (append takes writer then committed and never head).
+    ///
+    /// Only housekeeping, so it never waits for the writer: if an append or
+    /// a roll holds it, the next read that finds the log drained retries.
     fn reclaim_drained(&self, head: &mut Head) -> io::Result<()> {
-        let mut w = lock(&self.writer);
+        let mut w = match self.writer.try_lock() {
+            Ok(w) => w,
+            Err(TryLockError::Poisoned(e)) => e.into_inner(),
+            Err(TryLockError::WouldBlock) => return Ok(()),
+        };
         if w.pos != head.pos {
             // Something was appended since we read `committed`; not drained.
             return Ok(());
@@ -592,11 +651,13 @@ impl SegmentedLog {
             seg: old + 1,
             off: 0,
         };
-        w.file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create_new(true)
-            .open(segment_path(&self.dir, next.seg))?;
+        w.file = Arc::new(
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(segment_path(&self.dir, next.seg))?,
+        );
         w.pos = next;
         w.dirty = false;
         w.last_sync = Instant::now();
@@ -730,7 +791,7 @@ impl SegmentedLog {
         let mut w = lock(&self.writer);
         if w.dirty {
             w.file.sync_data()?;
-            self.persist_checkpoint(&w)?;
+            self.persist_checkpoint(w.pos, w.ordinal)?;
             w.dirty = false;
             w.last_sync = Instant::now();
         }
@@ -980,6 +1041,60 @@ mod tests {
         let log = open(dir.path(), 1 << 20);
         assert_eq!(log.len(), 3);
         assert_eq!(payloads(&log.read_batch(10).unwrap()), ["r1", "r2", "r3"]);
+    }
+
+    fn checkpoint_on_disk(dir: &Path) -> Mark {
+        let file = File::open(dir.join(CHECKPOINT_FILE)).unwrap();
+        match load_mark(&file).unwrap() {
+            Loaded::Mark(m) => m,
+            Loaded::PosOnly(_) | Loaded::Missing => panic!("no checkpoint"),
+        }
+    }
+
+    #[test]
+    fn reclaim_does_not_wait_for_the_writer_and_retries() {
+        let dir = TempDir::new().unwrap();
+        let log = open(dir.path(), 1 << 20);
+        log.append(b"a").unwrap();
+        log.append(b"b").unwrap();
+        {
+            // An append or roll in progress.
+            let _writer = lock(&log.writer);
+            assert_eq!(payloads(&log.read_batch(10).unwrap()), ["a", "b"]);
+        }
+        assert_eq!(list_segments(dir.path()).unwrap(), [0], "reclaim skipped");
+        // The next poll of the drained log finishes the job.
+        assert!(log.read_batch(10).unwrap().is_empty());
+        assert_eq!(list_segments(dir.path()).unwrap(), [1]);
+        log.append(b"c").unwrap();
+        assert_eq!(payloads(&log.read_batch(10).unwrap()), ["c"]);
+    }
+
+    #[test]
+    fn periodic_sync_moves_the_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        // Every append is due for a sync.
+        let log = SegmentedLog::open(dir.path(), 1 << 20, Duration::ZERO).unwrap();
+        log.append(b"one").unwrap();
+        log.append(b"two").unwrap();
+        let c = checkpoint_on_disk(dir.path());
+        assert_eq!(c.pos, *lock(&log.committed));
+        assert_eq!(c.ordinal, 2);
+        assert!(!lock(&log.writer).dirty);
+    }
+
+    #[test]
+    fn a_late_sync_never_moves_the_checkpoint_back() {
+        let dir = TempDir::new().unwrap();
+        let log = open_manual_sync(dir.path(), 1 << 20);
+        log.append(b"one").unwrap();
+        let early = *lock(&log.committed);
+        log.append(b"two").unwrap();
+        log.sync().unwrap();
+        let synced = checkpoint_on_disk(dir.path());
+        // A sync claimed before the second append finishing last.
+        log.persist_checkpoint(early, 1).unwrap();
+        assert_eq!(checkpoint_on_disk(dir.path()), synced);
     }
 
     #[test]
