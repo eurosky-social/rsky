@@ -3,7 +3,7 @@
 
 Wintermute is a monolithic indexer that subscribes to AT Protocol relays, processes the firehose, backfills historical data, and writes to a PostgreSQL database compatible with the bsky app-view dataplane.
 
-Wintermute combines three logical components (ingester, backfiller, indexer) into a single binary for simplified deployment. It uses Fjall (an LSM-tree embedded database) for high-throughput internal queues, avoiding external dependencies like Redis.
+Wintermute combines three logical components (ingester, backfiller, indexer) into a single binary for simplified deployment. It uses segmented append-only logs on local disk for its internal queues, avoiding external dependencies like Redis or an embedded database.
 
 Features and design decisions:
 
@@ -11,7 +11,7 @@ Features and design decisions:
 - automatic backfill: fetches historical data from PDSs via `com.atproto.sync.listRepos`
 - label subscription: connects to labeler services to index labels
 - parallel processing: independent queues for live events, backfill, and labels
-- durable queues: Fjall-backed on-disk queues survive restarts
+- durable queues: log-backed on-disk queues survive restarts
 - dataplane compatible: writes to PostgreSQL schema expected by bsky app-view
 - Prometheus metrics: exposes `/metrics` endpoint for monitoring
 - graceful shutdown: drains in-flight work on SIGTERM/SIGINT
@@ -34,7 +34,7 @@ This tool is designed for operating a bsky app-view that needs to index the enti
            |                v                |
            |         +-------------+         |
            |         |repo_backfill|         |
-           |         |   (fjall)   |         |
+           |         |   (queue log)|         |
            |         +------+------+         |
            |                |                |
            |                v                |
@@ -45,7 +45,7 @@ This tool is designed for operating a bsky app-view that needs to index the enti
            |                v                |
            |        +--------------+         |
            |        |firehose_     |         |
-           |        |backfill(fjall|         |
+           |        |backfill(log) |         |
            |        +------+-------+         |
            |               |                 |
            |    +----------+                 |
@@ -150,7 +150,7 @@ or overwrites them). See Reconciliation under Operations.
 
 ## Queues
 
-Wintermute uses Fjall for durable backfill queues:
+Wintermute uses segmented append-only logs (`src/queue_log.rs`) for durable queues:
 
 | Queue | Purpose |
 |-------|---------|
@@ -161,7 +161,7 @@ Wintermute uses Fjall for durable backfill queues:
 - **Firehose live events**: Parsed and indexed directly to PostgreSQL with concurrent tasks
 - **Label live events**: Parsed and indexed directly to PostgreSQL with concurrent tasks
 
-**Cursor state:** Stored in PostgreSQL `sub_state` table, not Fjall
+**Cursor state:** Stored in PostgreSQL `sub_state` table, with a local `cursors.cbor` fallback
 
 Backfill uses semaphore-controlled concurrency with backpressure. Live events are never blocked by backfill processing.
 
@@ -264,7 +264,7 @@ gate outcomes.
 
 ### Recovery
 
-Fjall queues are durable and survive crashes. On restart, wintermute:
+Queue logs are durable and survive crashes. On restart, wintermute:
 1. Resumes firehose from saved cursor
 2. Continues processing queued backfill work
 3. Reprocesses any in-flight records that weren't acknowledged
@@ -274,7 +274,7 @@ Fjall queues are durable and survive crashes. On restart, wintermute:
 ### System Requirements
 
 - **Memory**: 8GB minimum, 32GB+ recommended for full network indexing
-- **Storage**: 100GB+ for Fjall queues during backfill
+- **Storage**: 100GB+ for queue logs during backfill
 - **CPU**: 8+ cores recommended for parallel processing
 
 ### PostgreSQL

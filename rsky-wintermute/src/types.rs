@@ -4,7 +4,9 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum WintermuteError {
     #[error("storage error: {0}")]
-    Storage(#[from] fjall::Error),
+    Storage(String),
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
     #[error("postgres error: {0}")]
     Postgres(#[from] tokio_postgres::Error),
     #[error("pool error: {0}")]
@@ -29,19 +31,12 @@ pub enum WintermuteError {
 }
 
 impl WintermuteError {
-    /// Returns true if this error indicates storage corruption that requires recovery
+    /// Returns true if this error indicates storage corruption that requires recovery.
+    /// The queue logs self-heal (torn tails are truncated, corrupt records
+    /// skipped), so this is reserved for damage that open cannot repair.
     #[must_use]
     pub fn is_storage_corrupted(&self) -> bool {
-        match self {
-            Self::Storage(fjall_err) => {
-                // Check error message for corruption indicators
-                let msg = format!("{fjall_err:?}");
-                msg.contains("Poisoned")
-                    || msg.contains("JournalRecovery")
-                    || msg.contains("InvalidVersion")
-            }
-            _ => false,
-        }
+        matches!(self, Self::Storage(msg) if msg.contains("corrupt"))
     }
 }
 
