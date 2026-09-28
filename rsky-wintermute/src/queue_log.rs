@@ -11,8 +11,17 @@
 //!
 //! ```text
 //! <segment id, 20 digits>.seg   records: [u32 len][u32 crc32][payload]
-//! head                          [u64 seg][u64 off][u32 crc32][u32 zero]
+//! head                          mark of the next record to read
+//! checkpoint                    mark of the end of the last fsynced append
 //! ```
+//!
+//! A mark is `[u64 seg][u64 off][u64 ordinal][u64 epoch][u32 crc32][u32 0]`.
+//! The ordinal counts the records before that position; two marks with the
+//! same epoch share a base, so their difference is a record count. That is
+//! how open knows the unread count without walking the backlog: checkpoint
+//! minus head, plus a scan of the records appended since the checkpoint.
+//! Whenever the marks cannot be trusted the log rescans and starts a new
+//! epoch, so a stale or mismatched mark costs time, never correctness.
 //!
 //! Durability: appends are fsynced at most once per `fsync_interval`, on
 //! segment roll and on drop. The head is rewritten after every read batch
@@ -34,7 +43,10 @@ const RECORD_HEADER: usize = 8;
 /// Anything larger is treated as corruption rather than allocated.
 const MAX_RECORD: usize = 64 * 1024 * 1024;
 const HEAD_FILE: &str = "head";
-const HEAD_LEN: usize = 24;
+const CHECKPOINT_FILE: &str = "checkpoint";
+const MARK_LEN: usize = 40;
+/// Head files written before marks carried an ordinal: `[seg][off][crc][0]`.
+const LEGACY_HEAD_LEN: usize = 24;
 const READ_CHUNK: u64 = 1 << 20;
 
 /// A record's position: segment id, then byte offset within the segment.
@@ -55,24 +67,112 @@ impl Pos {
     }
 }
 
+/// A position plus the number of records before it (see the module docs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Mark {
+    pos: Pos,
+    ordinal: u64,
+    epoch: u64,
+}
+
+impl Mark {
+    fn encode(self) -> [u8; MARK_LEN] {
+        let mut buf = [0u8; MARK_LEN];
+        buf[..8].copy_from_slice(&self.pos.seg.to_be_bytes());
+        buf[8..16].copy_from_slice(&self.pos.off.to_be_bytes());
+        buf[16..24].copy_from_slice(&self.ordinal.to_be_bytes());
+        buf[24..32].copy_from_slice(&self.epoch.to_be_bytes());
+        let check = crc32(&buf[..32]);
+        buf[32..36].copy_from_slice(&check.to_le_bytes());
+        buf
+    }
+}
+
+fn be_u64(bytes: &[u8]) -> u64 {
+    u64::from_be_bytes(bytes.try_into().unwrap_or([0; 8]))
+}
+
+fn le_u32(bytes: &[u8]) -> u32 {
+    u32::from_le_bytes(bytes.try_into().unwrap_or([0; 4]))
+}
+
+/// What a mark file held: a full mark, a legacy head with a position only,
+/// or nothing usable (missing, short or failing its checksum).
+enum Loaded {
+    Mark(Mark),
+    PosOnly(Pos),
+    Missing,
+}
+
+fn load_mark(file: &File) -> io::Result<Loaded> {
+    let len = file.metadata()?.len();
+    if len == LEGACY_HEAD_LEN as u64 {
+        let mut buf = [0u8; LEGACY_HEAD_LEN];
+        file.read_exact_at(&mut buf, 0)?;
+        if crc32(&buf[..16]) != le_u32(&buf[16..20]) {
+            return Ok(Loaded::Missing);
+        }
+        return Ok(Loaded::PosOnly(Pos {
+            seg: be_u64(&buf[..8]),
+            off: be_u64(&buf[8..16]),
+        }));
+    }
+    if len < MARK_LEN as u64 {
+        return Ok(Loaded::Missing);
+    }
+    let mut buf = [0u8; MARK_LEN];
+    file.read_exact_at(&mut buf, 0)?;
+    if crc32(&buf[..32]) != le_u32(&buf[32..36]) {
+        return Ok(Loaded::Missing);
+    }
+    Ok(Loaded::Mark(Mark {
+        pos: Pos {
+            seg: be_u64(&buf[..8]),
+            off: be_u64(&buf[8..16]),
+        },
+        ordinal: be_u64(&buf[16..24]),
+        epoch: be_u64(&buf[24..32]),
+    }))
+}
+
+fn open_mark_file(path: &Path) -> io::Result<File> {
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
 struct Writer {
     file: File,
     /// Next append position.
     pos: Pos,
+    /// Records appended before `pos`, in the log's epoch.
+    ordinal: u64,
     dirty: bool,
     last_sync: Instant,
+}
+
+/// The consumer's position; `ordinal` counts the records before it.
+struct Head {
+    pos: Pos,
+    ordinal: u64,
 }
 
 pub struct SegmentedLog {
     dir: PathBuf,
     segment_bytes: u64,
     fsync_interval: Duration,
+    /// Base shared by every mark this process writes.
+    epoch: u64,
     writer: Mutex<Writer>,
     /// Everything before this position is fully written and readable.
     committed: Mutex<Pos>,
     /// Next record to read. Held for the whole of a read batch.
-    head: Mutex<Pos>,
+    head: Mutex<Head>,
     head_file: File,
+    checkpoint_file: File,
     unread: AtomicU64,
 }
 
@@ -199,19 +299,21 @@ fn scan_segment(file: &File, from: u64, to: u64) -> io::Result<(u64, u64)> {
     Ok((off, count))
 }
 
-fn load_head(file: &File) -> io::Result<Option<Pos>> {
-    let mut buf = [0u8; HEAD_LEN];
-    if file.metadata()?.len() < HEAD_LEN as u64 {
-        return Ok(None);
+/// Counts the valid records in `[from, tail)`. Every segment in between
+/// must exist.
+fn count_records(dir: &Path, from: Pos, tail: Pos) -> io::Result<u64> {
+    let mut count = 0u64;
+    for seg in from.seg..=tail.seg {
+        let file = File::open(segment_path(dir, seg))?;
+        let start = if seg == from.seg { from.off } else { 0 };
+        let end = if seg == tail.seg {
+            tail.off
+        } else {
+            file.metadata()?.len()
+        };
+        count += scan_segment(&file, start, end)?.1;
     }
-    file.read_exact_at(&mut buf, 0)?;
-    let want = u32::from_le_bytes([buf[16], buf[17], buf[18], buf[19]]);
-    if crc32(&buf[..16]) != want {
-        return Ok(None);
-    }
-    let seg = u64::from_be_bytes(buf[..8].try_into().unwrap_or([0; 8]));
-    let off = u64::from_be_bytes(buf[8..16].try_into().unwrap_or([0; 8]));
-    Ok(Some(Pos { seg, off }))
+    Ok(count)
 }
 
 impl SegmentedLog {
@@ -226,15 +328,17 @@ impl SegmentedLog {
         let dir = dir.into();
         fs::create_dir_all(&dir)?;
         let mut segs = list_segments(&dir)?;
-        let head_file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(dir.join(HEAD_FILE))?;
-        let persisted_head = load_head(&head_file)?;
+        let head_file = open_mark_file(&dir.join(HEAD_FILE))?;
+        let checkpoint_file = open_mark_file(&dir.join(CHECKPOINT_FILE))?;
+        let persisted_head = load_mark(&head_file)?;
+        let checkpoint = match load_mark(&checkpoint_file)? {
+            Loaded::Mark(m) => Some(m),
+            Loaded::PosOnly(_) | Loaded::Missing => None,
+        };
 
         // Tail: the last segment, truncated to its last complete record.
+        // Everything before the checkpoint was fsynced as whole records, so
+        // the torn-tail scan can start there.
         let tail_seg = segs.last().copied().unwrap_or(0);
         if segs.is_empty() {
             segs.push(0);
@@ -246,7 +350,11 @@ impl SegmentedLog {
             .truncate(false)
             .open(segment_path(&dir, tail_seg))?;
         let file_len = tail_file.metadata()?.len();
-        let (valid_end, _) = scan_segment(&tail_file, 0, file_len)?;
+        let scan_from = checkpoint
+            .map(|c| c.pos)
+            .filter(|p| p.seg == tail_seg && p.off <= file_len)
+            .map_or(0, |p| p.off);
+        let (valid_end, _) = scan_segment(&tail_file, scan_from, file_len)?;
         if valid_end < file_len {
             tracing::warn!(
                 "queue log {}: truncating torn tail of segment {tail_seg} from {file_len} to {valid_end} bytes",
@@ -264,7 +372,12 @@ impl SegmentedLog {
         // of segments that still exist. A missing or corrupt head file
         // re-delivers from the oldest segment, never skips.
         let first_seg = segs[0];
-        let mut head = match persisted_head {
+        let persisted_pos = match persisted_head {
+            Loaded::Mark(m) => Some(m.pos),
+            Loaded::PosOnly(p) => Some(p),
+            Loaded::Missing => None,
+        };
+        let mut head = match persisted_pos {
             Some(h) if h.seg >= first_seg => h,
             _ => Pos {
                 seg: first_seg,
@@ -280,45 +393,88 @@ impl SegmentedLog {
             remove_segment(&dir, seg);
         }
 
-        let mut unread = 0u64;
-        for &seg in segs.iter().filter(|&&s| s >= head.seg) {
-            let file = File::open(segment_path(&dir, seg))?;
-            let from = if seg == head.seg { head.off } else { 0 };
-            let to = if seg == tail.seg {
-                tail.off
-            } else {
-                file.metadata()?.len()
+        // Unread count. The head's ordinal is only an anchor if the head is
+        // used exactly as persisted; the checkpoint only if it shares the
+        // head's epoch and lies within [head, tail]. If the checkpoint is
+        // behind the head, everything unread was appended since it and the
+        // scan from the head is short. Otherwise rescan and start an epoch.
+        let head_anchor = match persisted_head {
+            Loaded::Mark(m) if m.pos == head => Some(m),
+            _ => None,
+        };
+        let (epoch, head_ordinal, unread) = if let Some(h) = head_anchor {
+            let unread = match checkpoint {
+                Some(c)
+                    if c.epoch == h.epoch
+                        && c.pos >= h.pos
+                        && c.pos <= tail
+                        && c.ordinal >= h.ordinal =>
+                {
+                    c.ordinal - h.ordinal + count_records(&dir, c.pos, tail)?
+                }
+                _ => count_records(&dir, head, tail)?,
             };
-            let (_, count) = scan_segment(&file, from, to)?;
-            unread += count;
-        }
+            (h.epoch, h.ordinal, unread)
+        } else {
+            (rand::random(), 0, count_records(&dir, head, tail)?)
+        };
+        let tail_ordinal = head_ordinal + unread;
 
         let log = Self {
             dir,
             segment_bytes,
             fsync_interval,
+            epoch,
             writer: Mutex::new(Writer {
                 file: tail_file,
                 pos: tail,
+                ordinal: tail_ordinal,
                 dirty: false,
                 last_sync: Instant::now(),
             }),
             committed: Mutex::new(tail),
-            head: Mutex::new(head),
+            head: Mutex::new(Head {
+                pos: head,
+                ordinal: head_ordinal,
+            }),
             head_file,
+            checkpoint_file,
             unread: AtomicU64::new(unread),
         };
-        log.persist_head(head)?;
+        log.persist_head(head, head_ordinal)?;
+        // A checkpoint from another epoch, or past a truncated tail, would
+        // force a full rescan on every open until the next periodic sync.
+        let checkpoint_usable = checkpoint.is_some_and(|c| c.epoch == epoch && c.pos <= tail);
+        if !checkpoint_usable {
+            let w = lock(&log.writer);
+            // Earlier segments were synced when the writer rolled past them.
+            if tail.off > 0 {
+                w.file.sync_data()?;
+            }
+            log.persist_checkpoint(&w)?;
+            drop(w);
+        }
         Ok(log)
     }
 
-    fn persist_head(&self, pos: Pos) -> io::Result<()> {
-        let mut buf = [0u8; HEAD_LEN];
-        buf[..8].copy_from_slice(&pos.seg.to_be_bytes());
-        buf[8..16].copy_from_slice(&pos.off.to_be_bytes());
-        let check = crc32(&buf[..16]);
-        buf[16..20].copy_from_slice(&check.to_le_bytes());
-        self.head_file.write_all_at(&buf, 0)
+    fn persist_head(&self, pos: Pos, ordinal: u64) -> io::Result<()> {
+        let mark = Mark {
+            pos,
+            ordinal,
+            epoch: self.epoch,
+        };
+        self.head_file.write_all_at(&mark.encode(), 0)
+    }
+
+    /// Records that everything before the writer's position is durable.
+    /// Call only right after an fsync of the writer's segment.
+    fn persist_checkpoint(&self, w: &Writer) -> io::Result<()> {
+        let mark = Mark {
+            pos: w.pos,
+            ordinal: w.ordinal,
+            epoch: self.epoch,
+        };
+        self.checkpoint_file.write_all_at(&mark.encode(), 0)
     }
 
     fn roll_if_full(&self, w: &mut Writer) -> io::Result<()> {
@@ -326,6 +482,7 @@ impl SegmentedLog {
             return Ok(());
         }
         w.file.sync_data()?;
+        self.persist_checkpoint(w)?;
         let next = w.pos.seg + 1;
         w.file = OpenOptions::new()
             .read(true)
@@ -341,6 +498,7 @@ impl SegmentedLog {
     fn sync_if_due(&self, w: &mut Writer) -> io::Result<()> {
         if w.dirty && w.last_sync.elapsed() >= self.fsync_interval {
             w.file.sync_data()?;
+            self.persist_checkpoint(w)?;
             w.dirty = false;
             w.last_sync = Instant::now();
         }
@@ -356,11 +514,14 @@ impl SegmentedLog {
         let pos = w.pos;
         w.file.write_all_at(&record, pos.off)?;
         w.pos.off += record.len() as u64;
+        w.ordinal += 1;
         w.dirty = true;
         self.sync_if_due(&mut w)?;
+        // Counted before the record becomes readable and under the writer
+        // lock, so neither a dequeue nor a recount can see it uncounted.
+        self.unread.fetch_add(1, Ordering::Relaxed);
         *lock(&self.committed) = w.pos;
         drop(w);
-        self.unread.fetch_add(1, Ordering::Relaxed);
         Ok(pos.to_key())
     }
 
@@ -371,17 +532,25 @@ impl SegmentedLog {
         }
         let mut head = lock(&self.head);
         let end = *lock(&self.committed);
-        let (records, new_head) = self.read_records(*head, end, limit)?;
-        if new_head == *head {
+        let (records, new_head, skipped) = self.read_records(head.pos, end, limit)?;
+        if new_head == head.pos {
             return Ok(records);
         }
-        self.persist_head(new_head)?;
-        for seg in head.seg..new_head.seg {
+        let ordinal = head.ordinal + records.len() as u64;
+        self.persist_head(new_head, ordinal)?;
+        for seg in head.pos.seg..new_head.seg {
             remove_segment(&self.dir, seg);
         }
-        *head = new_head;
+        *head = Head {
+            pos: new_head,
+            ordinal,
+        };
         if new_head == end && new_head.off > 0 {
             self.reclaim_drained(&mut head)?;
+        }
+        if skipped {
+            self.recount(&mut head)?;
+            return Ok(records);
         }
         drop(head);
         let taken = records.len() as u64;
@@ -393,13 +562,28 @@ impl SegmentedLog {
         Ok(records)
     }
 
+    /// Re-derives the unread count by scanning from the head. After a read
+    /// skipped a damaged segment tail, the records lost with it were never
+    /// counted as consumed; without this the overcount would persist in the
+    /// marks and outlive restarts. Holds the writer for the scan, so appends
+    /// stall, but only on this corruption path.
+    fn recount(&self, head: &mut Head) -> io::Result<()> {
+        let w = lock(&self.writer);
+        let unread = count_records(&self.dir, head.pos, w.pos)?;
+        head.ordinal = w.ordinal.saturating_sub(unread);
+        self.persist_head(head.pos, head.ordinal)?;
+        self.unread.store(unread, Ordering::Relaxed);
+        drop(w);
+        Ok(())
+    }
+
     /// A fully drained log still holds its current segment, every byte of
     /// it dead. Roll the writer to a fresh segment and unlink the old one,
     /// so a drained queue occupies no space. Lock order: head, writer,
     /// committed (append takes writer then committed and never head).
-    fn reclaim_drained(&self, head: &mut Pos) -> io::Result<()> {
+    fn reclaim_drained(&self, head: &mut Head) -> io::Result<()> {
         let mut w = lock(&self.writer);
-        if w.pos != *head {
+        if w.pos != head.pos {
             // Something was appended since we read `committed`; not drained.
             return Ok(());
         }
@@ -418,8 +602,8 @@ impl SegmentedLog {
         w.last_sync = Instant::now();
         *lock(&self.committed) = next;
         drop(w);
-        self.persist_head(next)?;
-        *head = next;
+        self.persist_head(next, head.ordinal)?;
+        head.pos = next;
         remove_segment(&self.dir, old);
         Ok(())
     }
@@ -434,9 +618,9 @@ impl SegmentedLog {
     pub fn for_each_unread(&self, mut f: impl FnMut(&[u8])) -> io::Result<()> {
         let head = lock(&self.head);
         let end = *lock(&self.committed);
-        let mut pos = *head;
+        let mut pos = head.pos;
         while pos < end {
-            let (records, next) = self.read_records(pos, end, 4096)?;
+            let (records, next, _) = self.read_records(pos, end, 4096)?;
             if records.is_empty() || next == pos {
                 break;
             }
@@ -450,21 +634,23 @@ impl SegmentedLog {
 
     /// Reads up to `limit` records without consuming them.
     pub fn peek(&self, limit: usize) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
-        let head = *lock(&self.head);
+        let head = lock(&self.head).pos;
         let end = *lock(&self.committed);
         Ok(self.read_records(head, end, limit)?.0)
     }
 
     /// Walks records from `pos` (exclusive of nothing) up to `end`, at most
-    /// `limit`. Returns the records and the position to resume from.
+    /// `limit`. Returns the records, the position to resume from, and
+    /// whether a torn or corrupt record made it skip the rest of a segment.
     #[allow(clippy::type_complexity)]
     fn read_records(
         &self,
         mut pos: Pos,
         end: Pos,
         limit: usize,
-    ) -> io::Result<(Vec<(Vec<u8>, Vec<u8>)>, Pos)> {
+    ) -> io::Result<(Vec<(Vec<u8>, Vec<u8>)>, Pos, bool)> {
         let mut out = Vec::with_capacity(limit.min(4096));
+        let mut skipped = false;
         while out.len() < limit && pos < end {
             let file = File::open(segment_path(&self.dir, pos.seg))?;
             let seg_end = if pos.seg < end.seg {
@@ -479,7 +665,9 @@ impl SegmentedLog {
                 let mut buf = vec![0u8; take as usize];
                 file.read_exact_at(&mut buf, pos.off)?;
                 let mut cursor = 0usize;
-                while out.len() < limit {
+                // A chunk used up exactly is not a torn record: the outer
+                // loop reads the next chunk or finishes the segment.
+                while out.len() < limit && cursor < buf.len() {
                     match parse_record(&buf[cursor..]) {
                         Parsed::Record { payload, total } => {
                             out.push((pos.to_key(), payload.to_vec()));
@@ -497,6 +685,7 @@ impl SegmentedLog {
                                     pos.off
                                 );
                                 pos.off = seg_end;
+                                skipped = true;
                             }
                             break;
                         }
@@ -508,6 +697,7 @@ impl SegmentedLog {
                                 pos.off
                             );
                             pos.off = seg_end;
+                            skipped = true;
                             break;
                         }
                     }
@@ -520,10 +710,11 @@ impl SegmentedLog {
                 };
             }
         }
-        Ok((out, pos))
+        Ok((out, pos, skipped))
     }
 
-    /// Records appended but not yet consumed. Exact and O(1).
+    /// Records appended but not yet consumed. O(1), and exact: a read that
+    /// skips a damaged segment tail recounts from the head.
     #[must_use]
     pub fn len(&self) -> usize {
         usize::try_from(self.unread.load(Ordering::Relaxed)).unwrap_or(usize::MAX)
@@ -539,6 +730,7 @@ impl SegmentedLog {
         let mut w = lock(&self.writer);
         if w.dirty {
             w.file.sync_data()?;
+            self.persist_checkpoint(&w)?;
             w.dirty = false;
             w.last_sync = Instant::now();
         }
@@ -674,7 +866,161 @@ mod tests {
         }
         fs::write(dir.path().join(HEAD_FILE), b"garbage").unwrap();
         let log = open(dir.path(), 1 << 20);
+        assert_eq!(log.len(), 2);
         assert_eq!(payloads(&log.read_batch(10).unwrap()), ["a", "b"]);
+    }
+
+    /// Never fsyncs on its own, so the checkpoint only moves on open, roll,
+    /// explicit sync and a clean drop.
+    fn open_manual_sync(dir: &Path, segment_bytes: u64) -> SegmentedLog {
+        SegmentedLog::open(dir, segment_bytes, Duration::from_secs(3600)).unwrap()
+    }
+
+    fn corrupt_payload_byte(dir: &Path, seg: u64, off: u64) {
+        let path = segment_path(dir, seg);
+        let mut bytes = fs::read(&path).unwrap();
+        #[allow(clippy::cast_possible_truncation)]
+        let at = off as usize + RECORD_HEADER;
+        bytes[at] ^= 0xff;
+        fs::write(&path, &bytes).unwrap();
+    }
+
+    #[test]
+    fn reopen_takes_len_from_marks_without_rescanning() {
+        let dir = TempDir::new().unwrap();
+        // 11-byte records, two per segment.
+        {
+            let log = open(dir.path(), 20);
+            for i in 0..10 {
+                log.append(format!("r0{i}").as_bytes()).unwrap();
+            }
+            assert_eq!(log.read_batch(1).unwrap().len(), 1);
+        }
+        // Damage a record between head and checkpoint. A rescan would stop
+        // counting at it; the marks still say 9.
+        corrupt_payload_byte(dir.path(), 2, 0);
+        let log = open(dir.path(), 20);
+        assert_eq!(log.len(), 9);
+    }
+
+    #[test]
+    fn crash_counts_appends_since_the_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        {
+            let log = open_manual_sync(dir.path(), 1 << 20);
+            for i in 0..5 {
+                log.append(format!("r{i}").as_bytes()).unwrap();
+            }
+            log.sync().unwrap();
+            for i in 5..8 {
+                log.append(format!("r{i}").as_bytes()).unwrap();
+            }
+            assert_eq!(log.read_batch(2).unwrap().len(), 2);
+            // Crash: no drop, so no final sync or checkpoint.
+            std::mem::forget(log);
+        }
+        let log = open_manual_sync(dir.path(), 1 << 20);
+        assert_eq!(log.len(), 6);
+        assert_eq!(
+            payloads(&log.read_batch(10).unwrap()),
+            ["r2", "r3", "r4", "r5", "r6", "r7"]
+        );
+    }
+
+    #[test]
+    fn crash_with_head_past_the_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        {
+            // The checkpoint is written at open and never moves after.
+            let log = open_manual_sync(dir.path(), 1 << 20);
+            for i in 0..4 {
+                log.append(format!("r{i}").as_bytes()).unwrap();
+            }
+            assert_eq!(log.read_batch(1).unwrap().len(), 1);
+            std::mem::forget(log);
+        }
+        let log = open_manual_sync(dir.path(), 1 << 20);
+        assert_eq!(log.len(), 3);
+        assert_eq!(payloads(&log.read_batch(10).unwrap()), ["r1", "r2", "r3"]);
+        // Drained and reclaimed, then crashed again: nothing unread.
+        std::mem::forget(log);
+        let log = open_manual_sync(dir.path(), 1 << 20);
+        assert_eq!(log.len(), 0);
+        log.append(b"next").unwrap();
+        assert_eq!(payloads(&log.read_batch(10).unwrap()), ["next"]);
+    }
+
+    #[test]
+    fn legacy_head_file_resumes_and_rescans() {
+        let dir = TempDir::new().unwrap();
+        let resume_at;
+        {
+            let log = open(dir.path(), 1 << 20);
+            for i in 0..4 {
+                log.append(format!("r{i}").as_bytes()).unwrap();
+            }
+            resume_at = log.read_batch(1).unwrap()[0].0.clone();
+        }
+        // The pre-ordinal head format, pointing just past r0.
+        let seg = be_u64(&resume_at[..8]);
+        let off = be_u64(&resume_at[8..]) + RECORD_HEADER as u64 + 2;
+        let mut legacy = [0u8; LEGACY_HEAD_LEN];
+        legacy[..8].copy_from_slice(&seg.to_be_bytes());
+        legacy[8..16].copy_from_slice(&off.to_be_bytes());
+        let check = crc32(&legacy[..16]);
+        legacy[16..20].copy_from_slice(&check.to_le_bytes());
+        let head_path = dir.path().join(HEAD_FILE);
+        fs::write(&head_path, legacy).unwrap();
+        fs::remove_file(dir.path().join(CHECKPOINT_FILE)).unwrap();
+
+        let log = open(dir.path(), 1 << 20);
+        assert_eq!(log.len(), 3);
+        assert_eq!(fs::metadata(&head_path).unwrap().len(), MARK_LEN as u64);
+        drop(log);
+        let log = open(dir.path(), 1 << 20);
+        assert_eq!(log.len(), 3);
+        assert_eq!(payloads(&log.read_batch(10).unwrap()), ["r1", "r2", "r3"]);
+    }
+
+    #[test]
+    fn reading_to_a_segment_end_is_not_a_skip() {
+        let dir = TempDir::new().unwrap();
+        // 11-byte records, two per segment.
+        let log = open(dir.path(), 20);
+        for i in 0..3 {
+            log.append(format!("r0{i}").as_bytes()).unwrap();
+        }
+        let start = lock(&log.head).pos;
+        let end = *lock(&log.committed);
+        // Across the segment boundary and up to the committed end.
+        let (records, pos, skipped) = log.read_records(start, end, 10).unwrap();
+        assert_eq!(payloads(&records), ["r00", "r01", "r02"]);
+        assert_eq!(pos, end);
+        assert!(!skipped);
+        // Stopping exactly at the end of the first segment.
+        let (records, _, skipped) = log.read_records(start, end, 2).unwrap();
+        assert_eq!(records.len(), 2);
+        assert!(!skipped);
+    }
+
+    #[test]
+    fn skipping_a_corrupt_segment_tail_recounts() {
+        let dir = TempDir::new().unwrap();
+        // 11-byte records: three per segment, the third overshooting.
+        let log = open_manual_sync(dir.path(), 30);
+        for i in 0..6 {
+            log.append(format!("r0{i}").as_bytes()).unwrap();
+        }
+        assert_eq!(log.len(), 6);
+        // r01 is damaged: the read skips r01 and r02.
+        corrupt_payload_byte(dir.path(), 0, 11);
+        assert_eq!(payloads(&log.read_batch(1).unwrap()), ["r00"]);
+        assert_eq!(payloads(&log.read_batch(1).unwrap()), ["r03"]);
+        assert_eq!(log.len(), 2);
+        drop(log);
+        let log = open_manual_sync(dir.path(), 30);
+        assert_eq!(log.len(), 2);
+        assert_eq!(payloads(&log.read_batch(10).unwrap()), ["r04", "r05"]);
     }
 
     #[test]
