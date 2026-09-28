@@ -1,0 +1,156 @@
+name: release-rsky-wintermute
+
+# Publishes prebuilt rsky-wintermute binaries as a GitHub release so hosts
+# install a CI-built artifact instead of compiling on the box.
+#
+# Releases are cut by hand: run this workflow on eurosky. The version is the
+# crate's Cargo.toml version (owned by upstream, which bumps it often) plus a
+# eurosky counter, e.g. 0.12.1-eurosky.1, then 0.12.1-eurosky.2 for the next
+# release on the same upstream version. The counter restarts at 1 when
+# upstream bumps. Tags are rsky-wintermute-v<version>.
+#
+# Dispatching on any other branch, and pull requests, only build the tarball
+# as a workflow artifact.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'rsky-wintermute/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain'
+      - '.github/workflows/release-rsky-wintermute.yaml'
+
+# Two releases computing the same counter at once would collide on the tag.
+concurrency:
+  group: release-rsky-wintermute-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    if: github.repository == 'eurosky-social/rsky'
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      base: ${{ steps.version.outputs.base }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Compute next version
+        id: version
+        run: |
+          base=$(sed -n 's/^version = "\(.*\)"$/\1/p' rsky-wintermute/Cargo.toml | head -1)
+          [[ -n "$base" ]] || { echo "no version in rsky-wintermute/Cargo.toml" >&2; exit 1; }
+
+          prefix="rsky-wintermute-v${base}-eurosky."
+          last=$(git ls-remote --tags --refs origin "refs/tags/${prefix}*" \
+            | sed -n "s|.*refs/tags/${prefix}\([0-9][0-9]*\)$|\1|p" \
+            | sort -n | tail -1)
+          version="${base}-eurosky.$(( ${last:-0} + 1 ))"
+
+          echo "base=${base}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "rsky-wintermute ${version}" >> "$GITHUB_STEP_SUMMARY"
+
+  build:
+    runs-on: ubuntu-latest
+    needs: version
+    timeout-minutes: 60
+    # The appview hosts run Debian 12 (glibc 2.36). Building on the runner's
+    # newer glibc produces binaries that refuse to start there.
+    container: rust:1.86-bookworm
+    defaults:
+      run:
+        shell: bash
+    permissions:
+      contents: read
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install build dependencies
+        # aws-lc-sys falls back to cmake when its cc build is unavailable.
+        run: apt-get update && apt-get install -y --no-install-recommends cmake jq
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: rsky-wintermute-release
+
+      - name: Build
+        run: cargo build --release --locked --package rsky-wintermute
+
+      - name: Package
+        run: |
+          # Every [[bin]] of the crate, including the ops tooling
+          # (direct_index, firehose_catchup, ...).
+          bins=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "rsky-wintermute")
+                     | .targets[] | select(.kind[] == "bin") | .name')
+
+          dir="rsky-wintermute-${VERSION}-${TARGET}"
+          mkdir -p "dist/${dir}"
+          for bin in $bins; do
+            cp "target/release/${bin}" "dist/${dir}/"
+          done
+          # The binaries report the upstream crate version; this names the release.
+          printf '%s\n%s\n' "$VERSION" "$GITHUB_SHA" > "dist/${dir}/VERSION"
+          cd "dist/${dir}"
+          sha256sum * > SHA256SUMS
+          cd ..
+          tar -czf "${dir}.tar.gz" "${dir}"
+          sha256sum "${dir}.tar.gz" > "${dir}.tar.gz.sha256"
+          cat "${dir}/SHA256SUMS"
+
+      - name: Upload tarball
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsky-wintermute-${{ env.VERSION }}-${{ env.TARGET }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    runs-on: ubuntu-latest
+    needs: [version, build]
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/eurosky'
+    permissions:
+      contents: write
+      attestations: write
+      id-token: write
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      BASE: ${{ needs.version.outputs.base }}
+    steps:
+      - name: Download tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: rsky-wintermute-${{ env.VERSION }}-${{ env.TARGET }}
+          path: dist
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: dist/*.tar.gz
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="rsky-wintermute-v${VERSION}"
+          notes="rsky-wintermute ${VERSION}: upstream crate version ${BASE}, built from ${GITHUB_SHA} for ${TARGET} (Debian 12 / glibc 2.36)."
+          gh release create "$tag" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "rsky-wintermute ${VERSION}" \
+            --notes "$notes"
