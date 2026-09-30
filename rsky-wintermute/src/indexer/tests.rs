@@ -3259,4 +3259,83 @@ mod indexer_tests {
         assert_eq!(q.next(), Some(("a".to_owned(), true)));
         assert!(q.is_empty());
     }
+
+    // Live-network soak of the handle sweep loop against real DIDs; never run
+    // in CI. Seed is a `did<TAB>handle` file; the test DB's actor table is
+    // replaced by it.
+    //   SWEEP_SEED=seed.tsv SWEEP_SECS=60 DB_POOL_SIZE=72 \
+    //   HANDLE_RESOLUTION_CONCURRENCY=100 HANDLE_RESOLUTION_BATCH_SIZE=1000 \
+    //   DATABASE_URL=... cargo test -p rsky-wintermute --lib handle_sweep_soak -- --ignored --nocapture
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    #[ignore]
+    #[allow(clippy::print_stdout)]
+    async fn handle_sweep_soak() {
+        tracing_subscriber::fmt()
+            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+            .try_init()
+            .unwrap_or_default();
+        let seed = std::env::var("SWEEP_SEED").expect("SWEEP_SEED");
+        let secs: u64 = std::env::var("SWEEP_SECS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(60);
+        let pool = setup_test_pool();
+        let client = pool.get().await.unwrap();
+        // This empties actor: refuse anything that looks like a real appview.
+        let existing: i64 = client
+            .query_one("SELECT count(*) FROM actor", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(
+            existing < 100_000,
+            "refusing to empty an actor table of {existing} rows; point DATABASE_URL at a test database"
+        );
+        client.execute("DELETE FROM actor", &[]).await.unwrap();
+        let mut seeded = 0u64;
+        for line in std::fs::read_to_string(seed).unwrap().lines() {
+            let mut parts = line.split('\t');
+            let (Some(did), Some(handle)) = (parts.next(), parts.next()) else {
+                continue;
+            };
+            seeded += client
+                .execute(
+                    "INSERT INTO actor (did, handle, \"indexedAt\") \
+                     VALUES ($1, $2, '1970-01-01T00:00:01Z') ON CONFLICT DO NOTHING",
+                    &[&did, &handle],
+                )
+                .await
+                .unwrap();
+        }
+
+        let (storage, _dir) = setup_test_storage();
+        let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:postgres@localhost:5432/bsky_test".to_owned()
+        });
+        let manager = IndexerManager::new(Arc::new(storage), &database_url).unwrap();
+        let started = std::time::Instant::now();
+        let _ = tokio::time::timeout(
+            std::time::Duration::from_secs(secs),
+            manager.process_handle_resolution_loop(),
+        )
+        .await;
+        let elapsed = started.elapsed().as_secs_f64();
+
+        let row = client
+            .query_one(
+                "SELECT count(*) FILTER (WHERE \"indexedAt\" <> '1970-01-01T00:00:01Z'), \
+                        count(*) FILTER (WHERE \"indexedAt\" <> '1970-01-01T00:00:01Z' AND \"handleResolveTries\" = 0 AND handle IS NOT NULL) \
+                 FROM actor",
+                &[],
+            )
+            .await
+            .unwrap();
+        let (done, verified): (i64, i64) = (row.get(0), row.get(1));
+        #[allow(clippy::cast_precision_loss)]
+        let rate = done as f64 / elapsed;
+        println!(
+            "soak: seeded {seeded}, processed {done} ({verified} verified) in {elapsed:.0}s = {rate:.1}/s"
+        );
+        assert!(done > 0, "the sweep made no progress");
+    }
 }

@@ -10,24 +10,33 @@ pub struct DidPlcResolver {
     pub plc_url: String,
     pub timeout: Duration,
     pub cache: Option<Arc<dyn DidCache>>,
+    /// Built once and shared by every clone (reqwest clients are reference
+    /// counted), so lookups reuse pooled connections to the directory. A
+    /// client per lookup reloaded TLS roots and opened a fresh TCP+TLS
+    /// connection every time; at a few hundred lookups in flight that storm
+    /// of new connections is refused by the directory's front end.
+    client: reqwest::Client,
 }
 
 impl DidPlcResolver {
     pub fn new(plc_url: String, timeout: Duration, cache: Option<Arc<dyn DidCache>>) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .unwrap_or_default();
         Self {
             plc_url,
             timeout,
             cache,
+            client,
         }
     }
 
     pub async fn resolve_no_check(&self, did: String) -> Result<Option<Value>> {
-        let client = reqwest::Client::new();
-        let response = client
+        let response = self
+            .client
             .get(format!("{0}/{1}", self.plc_url, encode_uri_component(&did)))
             .timeout(self.timeout)
-            .header("Connection", "Keep-Alive")
-            .header("Keep-Alive", "timeout=5, max=1000")
             .send()
             .await?;
         let res = &response;
