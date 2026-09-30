@@ -207,16 +207,31 @@ impl IndexerManager {
         );
         let id_resolver = Arc::clone(&self.id_resolver);
         let pool = self.pool_labels.clone();
+        // Each resolution runs as its own task. Kept as plain futures in the
+        // FuturesUnordered they only advanced while the loop awaited that set,
+        // so a refill query froze every in-flight resolution, including those
+        // holding pool connections mid-write, and the refill then timed out
+        // waiting for a connection they held.
         let make_future = |did: String| -> HandleFuture {
             let pool = pool.clone();
             let id_resolver = Arc::clone(&id_resolver);
-            Box::pin(async move {
+            let task_did = did.clone();
+            let task = tokio::spawn(async move {
                 let timestamp = chrono::Utc::now()
                     .format("%Y-%m-%dT%H:%M:%S%.3fZ")
                     .to_string();
-                let outcome = Self::index_handle(&pool, &id_resolver, &did, &timestamp, false)
+                Self::index_handle(&pool, &id_resolver, &task_did, &timestamp, false)
                     .await
-                    .ok();
+                    .ok()
+            });
+            Box::pin(async move {
+                let outcome = match task.await {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        tracing::warn!("handle resolution task for {did} failed: {e}");
+                        None
+                    }
+                };
                 (did, outcome)
             })
         };
