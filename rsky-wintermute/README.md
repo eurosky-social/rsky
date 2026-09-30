@@ -252,6 +252,15 @@ in `handleResolveTries` buckets: a never-tried actor is resolved immediately,
 and each failure doubles the wait (1h, 2h, 4h ... capped at 7 days), so DIDs
 that never resolve cannot hold up the queue.
 
+Only a definitive answer changes a stored handle: NXDOMAIN or no `_atproto`
+record together with a well-known 404/410 (or a response that is not a DID)
+clears it. A transient failure (resolver timeout, well-known 429 or 5xx,
+unreachable host) only records a try, so an upstream rate limit or outage
+cannot erase handles in bulk. Each resolution holds a database connection only
+around its reads and writes, so throughput scales with
+`HANDLE_RESOLUTION_CONCURRENCY`; point `PLC_URL` at a nearby PLC mirror to keep
+the DID-document lookups fast.
+
 The sweep needs the partial indexes in
 `migrations/add_actor_handle_sweep_indexes.sql` (built `CONCURRENTLY`; apply
 with plain `psql -f`, not in a transaction). Without them each batch selection
