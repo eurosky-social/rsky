@@ -4,7 +4,7 @@ pub mod safe_fetch;
 
 use crate::did::did_resolver::DidResolver;
 use crate::handle::HandleResolver;
-use crate::types::{DidResolverOpts, HandleResolverOpts, IdentityResolverOpts, MemoryCache};
+use crate::types::{DidResolverOpts, HandleResolverOpts, IdentityResolverOpts, NoCache};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -23,12 +23,9 @@ impl IdResolver {
             backup_nameservers,
         } = opts;
         let timeout = timeout.unwrap_or_else(|| Duration::from_millis(3000));
-        let did_cache = did_cache.unwrap_or_else(|| {
-            Arc::new(MemoryCache::new(
-                Some(Duration::default()),
-                Some(Duration::default()),
-            ))
-        });
+        // No cache asked for means no cache: the old default (a zero-TTL
+        // MemoryCache) never hit but kept every document forever.
+        let did_cache = did_cache.unwrap_or_else(|| Arc::new(NoCache));
 
         Self {
             handle: HandleResolver::new(HandleResolverOpts {
