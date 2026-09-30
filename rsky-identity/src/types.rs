@@ -5,6 +5,7 @@ use std::collections::BTreeMap;
 use std::fmt::Debug;
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
@@ -99,7 +100,14 @@ pub struct MemoryCache {
     pub stale_ttl: Duration,
     pub max_ttl: Duration,
     pub cache: RwLock<BTreeMap<String, CacheVal>>,
+    /// Inserts since creation; every `PRUNE_EVERY`th insert drops expired entries.
+    inserts: AtomicU64,
 }
+
+/// How often (in inserts) `MemoryCache` sweeps out expired entries. Entries
+/// are otherwise only checked when read, so without this a long-running
+/// process that resolves many distinct DIDs keeps every document forever.
+const PRUNE_EVERY: u64 = 4096;
 
 impl MemoryCache {
     pub fn new(stale_ttl: Option<Duration>, max_ttl: Option<Duration>) -> Self {
@@ -107,17 +115,60 @@ impl MemoryCache {
             stale_ttl: stale_ttl.unwrap_or_else(|| Duration::new(HOUR as u64, 0)),
             max_ttl: max_ttl.unwrap_or_else(|| Duration::new(DAY as u64, 0)),
             cache: RwLock::new(BTreeMap::new()),
+            inserts: AtomicU64::new(0),
         }
+    }
+
+    fn now_micros() -> u128 {
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("timestamp in micros since UNIX epoch")
+            .as_micros()
+    }
+
+    /// Drops every entry older than `max_ttl`; returns how many remain.
+    pub fn prune_expired(&self) -> usize {
+        let cutoff = Self::now_micros().saturating_sub(self.max_ttl.as_micros());
+        let mut cache = self.cache.write().expect("did cache poisoned");
+        cache.retain(|_, val| val.updated_at >= cutoff);
+        cache.len()
+    }
+}
+
+/// A `DidCache` that stores nothing: every lookup misses. The default when an
+/// `IdResolver` is built without a cache. The previous default was a
+/// `MemoryCache` with zero TTLs, whose entries were expired on insert (so it
+/// never produced a hit) but were kept forever, leaking ~1KB per distinct DID.
+#[derive(Debug, Default)]
+pub struct NoCache;
+
+#[async_trait::async_trait]
+impl DidCache for NoCache {
+    async fn cache_did(&self, _did: String, _doc: DidDocument) -> Result<()> {
+        Ok(())
+    }
+
+    async fn refresh_cache(&self, _did: String, _get_doc: GetDocFn) -> Result<()> {
+        Ok(())
+    }
+
+    async fn check_cache(&self, _did: String) -> Result<Option<CacheResult>> {
+        Ok(None)
+    }
+
+    async fn clear_entry(&self, _did: String) -> Result<()> {
+        Ok(())
+    }
+
+    async fn clear(&self) -> Result<()> {
+        Ok(())
     }
 }
 
 #[async_trait::async_trait]
 impl DidCache for MemoryCache {
     async fn cache_did(&self, did: String, doc: DidDocument) -> Result<()> {
-        let now = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .expect("timestamp in micros since UNIX epoch")
-            .as_micros();
+        let now = Self::now_micros();
         self.cache.write().expect("did cache poisoned").insert(
             did,
             CacheVal {
@@ -125,6 +176,9 @@ impl DidCache for MemoryCache {
                 updated_at: now,
             },
         );
+        if (self.inserts.fetch_add(1, Ordering::Relaxed) + 1) % PRUNE_EVERY == 0 {
+            self.prune_expired();
+        }
         Ok(())
     }
 
@@ -219,6 +273,41 @@ mod tests {
             .unwrap();
         assert!(result.stale);
         assert!(result.expired);
+    }
+
+    #[tokio::test]
+    async fn memory_cache_prunes_expired_entries_as_it_grows() {
+        let cache = MemoryCache::new(Some(Duration::from_secs(0)), Some(Duration::from_secs(0)));
+        for i in 0..PRUNE_EVERY {
+            let did = format!("did:example:{i}");
+            cache.cache_did(did.clone(), doc(&did)).await.unwrap();
+        }
+        // The PRUNE_EVERY-th insert swept out everything already expired.
+        assert!(cache.cache.read().unwrap().len() < 2);
+    }
+
+    #[tokio::test]
+    async fn memory_cache_prune_keeps_live_entries() {
+        let cache = MemoryCache::new(None, None);
+        cache
+            .cache_did("did:example:dave".to_owned(), doc("did:example:dave"))
+            .await
+            .unwrap();
+        assert_eq!(cache.prune_expired(), 1);
+    }
+
+    #[tokio::test]
+    async fn no_cache_stores_nothing() {
+        let cache = NoCache;
+        cache
+            .cache_did("did:example:erin".to_owned(), doc("did:example:erin"))
+            .await
+            .unwrap();
+        assert!(cache
+            .check_cache("did:example:erin".to_owned())
+            .await
+            .unwrap()
+            .is_none());
     }
 
     #[tokio::test]
