@@ -1022,8 +1022,8 @@ async fn a_failed_write_after_the_boundary_keeps_the_fence_for_the_workflow() {
     let client = pool.get().await.unwrap();
     client
         .batch_execute(&format!(
-            "{REFUSE_FN} DROP TRIGGER IF EXISTS wintermute_test_refuse_record ON record; \
-             CREATE TRIGGER wintermute_test_refuse_record BEFORE INSERT ON record FOR EACH ROW \
+            "{REFUSE_FN} DROP TRIGGER IF EXISTS wintermute_test_refuse_record_fence ON record; \
+             CREATE TRIGGER wintermute_test_refuse_record_fence BEFORE INSERT ON record FOR EACH ROW \
              WHEN (NEW.did = '{did}') EXECUTE FUNCTION wintermute_test_refuse();"
         ))
         .await
@@ -1045,7 +1045,7 @@ async fn a_failed_write_after_the_boundary_keeps_the_fence_for_the_workflow() {
         Some(("boundary".to_owned(), "wf-test".to_owned()))
     );
     client
-        .batch_execute("DROP TRIGGER wintermute_test_refuse_record ON record")
+        .batch_execute("DROP TRIGGER wintermute_test_refuse_record_fence ON record")
         .await
         .unwrap();
     let err = reconcile(
@@ -1119,8 +1119,8 @@ async fn a_commit_acknowledgement_is_retried_until_it_is_durable() {
     // a record write that fails in the same batch withholds the acknowledgement
     client
         .batch_execute(&format!(
-            "DROP TRIGGER IF EXISTS wintermute_test_refuse_record ON record; \
-             CREATE TRIGGER wintermute_test_refuse_record BEFORE INSERT ON record FOR EACH ROW \
+            "DROP TRIGGER IF EXISTS wintermute_test_refuse_record_ack ON record; \
+             CREATE TRIGGER wintermute_test_refuse_record_ack BEFORE INSERT ON record FOR EACH ROW \
              WHEN (NEW.did = '{did}') EXECUTE FUNCTION wintermute_test_refuse();"
         ))
         .await
@@ -1162,7 +1162,7 @@ async fn a_commit_acknowledgement_is_retried_until_it_is_durable() {
         Some("bafyack")
     );
     client
-        .batch_execute("DROP TRIGGER wintermute_test_refuse_record ON record")
+        .batch_execute("DROP TRIGGER wintermute_test_refuse_record_ack ON record")
         .await
         .unwrap();
     reset_actor(&pool, did).await;
