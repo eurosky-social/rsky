@@ -100,6 +100,21 @@ impl std::fmt::Debug for HandleResolver {
     }
 }
 
+/// The well-known transport: every handle is its own host, so no idle pool.
+fn one_shot_client(policy: NetworkPolicy, timeout: Duration) -> SafeClient {
+    SafeClient::new(policy, timeout)
+        .and_then(|c| c.without_idle_pool(timeout))
+        .expect("reqwest client")
+}
+
+/// The `_atproto` record name as an absolute name (trailing dot), so the
+/// resolver never also tries it under the host's search domains: a handle
+/// without the record (the common case) would otherwise cost one extra
+/// NXDOMAIN query per search domain.
+fn txt_name(handle: &str) -> String {
+    format!("{SUBDOMAIN}.{handle}.")
+}
+
 /// The host's resolver (resolv.conf), not a hardcoded public one: hosts often
 /// cannot reach 8.8.8.8 directly (egress filtering, or a local forwarder such
 /// as systemd-resolved or Tailscale's), and then every TXT lookup burns the
@@ -120,7 +135,7 @@ impl HandleResolver {
             timeout,
             backup_nameservers: opts.backup_nameservers,
             backup_nameserver_ips: None,
-            client: SafeClient::new(NetworkPolicy::PUBLIC, timeout).expect("reqwest client"),
+            client: one_shot_client(NetworkPolicy::PUBLIC, timeout),
             dns: dns_resolver(timeout),
         }
     }
@@ -128,7 +143,7 @@ impl HandleResolver {
     /// Resolves well-known documents under `policy` instead of the public
     /// default.
     pub fn with_network(mut self, policy: NetworkPolicy) -> Self {
-        self.client = SafeClient::new(policy, self.timeout).expect("reqwest client");
+        self.client = one_shot_client(policy, self.timeout);
         self
     }
 
@@ -175,8 +190,8 @@ impl HandleResolver {
         }
     }
 
-    async fn probe_dns(&self, handle: &String) -> Probe {
-        match self.dns.txt_lookup(format!("{SUBDOMAIN}.{handle}")).await {
+    async fn probe_dns(&self, handle: &str) -> Probe {
+        match self.dns.txt_lookup(txt_name(handle)).await {
             Ok(records) => {
                 let records = records.iter().map(|r| r.to_string()).collect();
                 match self.parse_dns_result(records) {
@@ -217,7 +232,7 @@ impl HandleResolver {
     }
 
     pub async fn resolve_dns(&self, handle: &String) -> Result<Option<String>> {
-        let results = match self.dns.txt_lookup(format!("{SUBDOMAIN}.{handle}")).await {
+        let results = match self.dns.txt_lookup(txt_name(handle)).await {
             Ok(res) => res,
             Err(_) => return Ok(None),
         };
@@ -270,7 +285,7 @@ impl HandleResolver {
 
                 let resolver = TokioAsyncResolver::tokio(config, ResolverOpts::default());
 
-                let results = match resolver.txt_lookup(format!("{SUBDOMAIN}.{handle}")).await {
+                let results = match resolver.txt_lookup(txt_name(handle)).await {
                     Ok(res) => res,
                     Err(_) => return Ok(None),
                 };
@@ -340,6 +355,11 @@ mod tests {
             backup_nameservers: None,
         });
         assert_eq!(resolver.timeout, Duration::from_millis(1500));
+    }
+
+    #[test]
+    fn txt_name_is_absolute() {
+        assert_eq!(txt_name("alice.bsky.social"), "_atproto.alice.bsky.social.");
     }
 
     #[test]

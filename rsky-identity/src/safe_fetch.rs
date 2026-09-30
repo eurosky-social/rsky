@@ -297,6 +297,19 @@ impl SafeClient {
         })
     }
 
+    /// The same client without idle connection reuse, for callers that reach
+    /// each host once (per-handle well-known lookups): idle connections kept
+    /// for one-off hosts only pile up as open sockets and tracked connections.
+    pub fn without_idle_pool(self, timeout: Duration) -> Result<Self, FetchError> {
+        let client = reqwest::Client::builder()
+            .timeout(timeout)
+            .redirect(Policy::none())
+            .dns_resolver(self.resolver.clone())
+            .pool_max_idle_per_host(0)
+            .build()?;
+        Ok(Self { client, ..self })
+    }
+
     /// A builder for a transport with the same resolution and no redirects,
     /// for callers that need their own default headers or timeouts. Check
     /// every URL sent through it with [`SafeClient::check`].
