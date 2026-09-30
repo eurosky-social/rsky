@@ -3235,4 +3235,28 @@ mod indexer_tests {
             .await
             .unwrap();
     }
+
+    // Overlapping fetches return rows that are still queued or in flight (their
+    // indexedAt only moves when they finish); the sweep must not start them twice.
+    #[test]
+    fn sweep_queue_skips_dids_already_queued_or_in_flight() {
+        let mut q = crate::indexer::SweepQueue::default();
+        let dids = |v: &[&str]| v.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+
+        assert_eq!(q.add(dids(&["a", "b", "c"]), 1), 3);
+        assert_eq!(q.next(), Some(("a".to_owned(), true)));
+        assert_eq!(q.next(), Some(("b".to_owned(), false)));
+
+        // a and b are in flight, c is queued: only d is new.
+        assert_eq!(q.add(dids(&["a", "b", "c", "d"]), 0), 1);
+        assert_eq!(q.len(), 2);
+
+        // Once a finishes it can be picked again by a later fetch.
+        q.done("a");
+        assert_eq!(q.add(dids(&["a"]), 1), 1);
+        assert_eq!(q.next(), Some(("c".to_owned(), false)));
+        assert_eq!(q.next(), Some(("d".to_owned(), false)));
+        assert_eq!(q.next(), Some(("a".to_owned(), true)));
+        assert!(q.is_empty());
+    }
 }

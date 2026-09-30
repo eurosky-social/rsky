@@ -192,16 +192,39 @@ impl IndexerManager {
         Ok(())
     }
 
+    /// Keeps `HANDLE_RESOLUTION_CONCURRENCY` resolutions in flight, refilling
+    /// from the database as slots free up. The previous batch-at-a-time loop
+    /// waited for every lookup in a batch, so each batch cost its slowest
+    /// lookup (DNS/HTTP timeouts): throughput stopped scaling with concurrency.
     async fn process_handle_resolution_loop(&self) {
         type HandleFuture =
-            std::pin::Pin<Box<dyn std::future::Future<Output = Option<bool>> + Send>>;
+            std::pin::Pin<Box<dyn std::future::Future<Output = (String, Option<bool>)> + Send>>;
 
-        let max_concurrent = *HANDLE_RESOLUTION_CONCURRENCY;
+        let max_concurrent = (*HANDLE_RESOLUTION_CONCURRENCY).max(1);
         tracing::info!(
             "handle resolution processor started (concurrency={max_concurrent}, batch={})",
             *HANDLE_RESOLUTION_BATCH_SIZE
         );
-        let mut batch_count = 0u64;
+        let id_resolver = Arc::clone(&self.id_resolver);
+        let pool = self.pool_labels.clone();
+        let make_future = |did: String| -> HandleFuture {
+            let pool = pool.clone();
+            let id_resolver = Arc::clone(&id_resolver);
+            Box::pin(async move {
+                let timestamp = chrono::Utc::now()
+                    .format("%Y-%m-%dT%H:%M:%S%.3fZ")
+                    .to_string();
+                let outcome = Self::index_handle(&pool, &id_resolver, &did, &timestamp, false)
+                    .await
+                    .ok();
+                (did, outcome)
+            })
+        };
+
+        let mut queue = SweepQueue::default();
+        let mut in_flight: FuturesUnordered<HandleFuture> = FuturesUnordered::new();
+        let mut next_fetch = tokio::time::Instant::now();
+        let mut window = SweepWindow::new();
         let mut total_resolved = 0u64;
 
         loop {
@@ -210,87 +233,56 @@ impl IndexerManager {
                 break;
             }
 
-            let (dids_to_resolve, stale_count) =
+            // Top up the queue once it runs low. Rows still queued or in flight
+            // come back from the query (their indexedAt only moves when they
+            // finish) and are skipped; a fetch that brings little new work
+            // backs off for a second rather than re-querying per completion.
+            if queue.len() < max_concurrent && tokio::time::Instant::now() >= next_fetch {
                 match self.get_actors_needing_handle_resolution().await {
-                    Ok(picked) => picked,
+                    Ok((dids, stale_count)) => {
+                        let added = queue.add(dids, stale_count);
+                        if added < max_concurrent / 2 {
+                            next_fetch = tokio::time::Instant::now() + Duration::from_secs(1);
+                        }
+                    }
                     Err(e) => {
                         tracing::warn!("failed to get actors needing handle resolution: {e}");
-                        tokio::time::sleep(Duration::from_secs(5)).await;
-                        continue;
+                        next_fetch = tokio::time::Instant::now() + Duration::from_secs(5);
                     }
-                };
+                }
+            }
 
-            if dids_to_resolve.is_empty() {
-                // No work to do, sleep longer
-                tokio::time::sleep(Duration::from_secs(10)).await;
+            while in_flight.len() < max_concurrent {
+                let Some((did, stale)) = queue.next() else {
+                    break;
+                };
+                window.started(stale);
+                in_flight.push(make_future(did));
+            }
+
+            if in_flight.is_empty() {
+                // Nothing to do: wait for the next fetch (10s when idle).
+                let idle = if queue.is_empty() {
+                    next_fetch =
+                        next_fetch.max(tokio::time::Instant::now() + Duration::from_secs(10));
+                    next_fetch
+                } else {
+                    tokio::time::Instant::now()
+                };
+                tokio::time::sleep_until(idle).await;
                 continue;
             }
 
-            batch_count += 1;
-            let batch_size = dids_to_resolve.len();
-
-            let timestamp = chrono::Utc::now()
-                .format("%Y-%m-%dT%H:%M:%S%.3fZ")
-                .to_string();
-            let id_resolver = Arc::clone(&self.id_resolver);
-            let pool = self.pool_labels.clone();
-
-            // Process handles in parallel using FuturesUnordered with boxed futures
-            let mut in_flight: FuturesUnordered<HandleFuture> = FuturesUnordered::new();
-            let mut pending_dids = dids_to_resolve.into_iter();
-            let mut resolved_count = 0usize;
-
-            let make_future = |pool: Pool,
-                               id_resolver: Arc<IdResolver>,
-                               did: String,
-                               timestamp: String|
-             -> HandleFuture {
-                Box::pin(async move {
-                    Self::index_handle(&pool, &id_resolver, &did, &timestamp, false)
-                        .await
-                        .ok()
-                })
-            };
-
-            // Seed initial batch of concurrent tasks
-            for did in pending_dids.by_ref().take(max_concurrent) {
-                in_flight.push(make_future(
-                    pool.clone(),
-                    Arc::clone(&id_resolver),
-                    did,
-                    timestamp.clone(),
-                ));
+            if let Some((did, outcome)) = in_flight.next().await {
+                queue.done(&did);
+                let resolved = outcome == Some(true);
+                total_resolved += u64::from(resolved);
+                window.finished(resolved);
             }
 
-            // Process results and spawn new tasks as slots free up
-            while let Some(result) = in_flight.next().await {
-                if result == Some(true) {
-                    resolved_count += 1;
-                }
-
-                // Spawn next task if there are more DIDs
-                if let Some(did) = pending_dids.next() {
-                    in_flight.push(make_future(
-                        pool.clone(),
-                        Arc::clone(&id_resolver),
-                        did,
-                        timestamp.clone(),
-                    ));
-                }
+            if let Some(line) = window.report(in_flight.len(), total_resolved) {
+                tracing::info!("{line}");
             }
-
-            total_resolved += resolved_count as u64;
-
-            // Log progress every 10 batches or when handles are resolved
-            if batch_count % 10 == 1 || resolved_count > 0 {
-                tracing::info!(
-                    "handle resolution batch {batch_count}: {resolved_count}/{batch_size} resolved (stale={stale_count}, null={}, total: {total_resolved})",
-                    batch_size - stale_count
-                );
-            }
-
-            // Small delay between batches to avoid overwhelming the system
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
     }
 
@@ -5766,5 +5758,96 @@ impl IndexerManager {
             .execute("DELETE FROM verification WHERE uri = $1", &[&uri])
             .await?;
         Ok(())
+    }
+}
+
+/// DIDs picked by the handle sweep and not yet finished, in pick order, with
+/// whether each came from the stale non-NULL query. `add` skips DIDs already
+/// queued or in flight, so overlapping fetches never resolve a row twice.
+#[derive(Default)]
+pub(crate) struct SweepQueue {
+    pending: std::collections::VecDeque<(String, bool)>,
+    active: std::collections::HashSet<String>,
+}
+
+impl SweepQueue {
+    /// Queues the new DIDs of a fetch (the first `stale_count` are stale
+    /// non-NULL picks); returns how many were new.
+    pub(crate) fn add(&mut self, dids: Vec<String>, stale_count: usize) -> usize {
+        let mut added = 0;
+        for (i, did) in dids.into_iter().enumerate() {
+            if self.active.insert(did.clone()) {
+                self.pending.push_back((did, i < stale_count));
+                added += 1;
+            }
+        }
+        added
+    }
+
+    /// The next DID to start; it stays active until `done`.
+    pub(crate) fn next(&mut self) -> Option<(String, bool)> {
+        self.pending.pop_front()
+    }
+
+    pub(crate) fn done(&mut self, did: &str) {
+        self.active.remove(did);
+    }
+
+    /// DIDs waiting to start (not counting those in flight).
+    pub(crate) fn len(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.pending.is_empty()
+    }
+}
+
+/// Handle-sweep progress over a 30s window, for the periodic log line.
+struct SweepWindow {
+    since: std::time::Instant,
+    started_stale: u64,
+    started_null: u64,
+    finished: u64,
+    resolved: u64,
+}
+
+impl SweepWindow {
+    fn new() -> Self {
+        Self {
+            since: std::time::Instant::now(),
+            started_stale: 0,
+            started_null: 0,
+            finished: 0,
+            resolved: 0,
+        }
+    }
+
+    const fn started(&mut self, stale: bool) {
+        if stale {
+            self.started_stale += 1;
+        } else {
+            self.started_null += 1;
+        }
+    }
+
+    fn finished(&mut self, resolved: bool) {
+        self.finished += 1;
+        self.resolved += u64::from(resolved);
+    }
+
+    fn report(&mut self, in_flight: usize, total_resolved: u64) -> Option<String> {
+        let secs = self.since.elapsed().as_secs_f64();
+        if secs < 30.0 {
+            return None;
+        }
+        #[allow(clippy::cast_precision_loss)]
+        let rate = self.finished as f64 / secs;
+        let line = format!(
+            "handle resolution: {}/{} resolved in {secs:.0}s ({rate:.1}/s; started stale={}, null={}; in flight {in_flight}; total resolved: {total_resolved})",
+            self.resolved, self.finished, self.started_stale, self.started_null
+        );
+        *self = Self::new();
+        Some(line)
     }
 }

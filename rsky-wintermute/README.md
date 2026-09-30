@@ -106,7 +106,7 @@ RUST_LOG=info \
 | `BACKFILLER_TIMEOUT_SECS` | `120` | Timeout for fetching repo CAR from PDS |
 | `INLINE_CONCURRENCY` | `100` | Concurrent inline indexing tasks for firehose events |
 | `DB_POOL_SIZE` | `20` | Connections per pool (4 pools: firehose, labels, indexer, backfiller) |
-| `HANDLE_RESOLUTION_BATCH_SIZE` | `500` | Actors per handle-resolution batch |
+| `HANDLE_RESOLUTION_BATCH_SIZE` | `500` | Actors the handle sweep selects per top-up of its queue |
 | `HANDLE_RESOLUTION_CONCURRENCY` | `50` | Concurrent handle resolutions within a batch |
 | `HANDLE_STALE_VALID_SHARE` | `50` | Percent of each handle-resolution batch reserved for re-verifying stale non-NULL handles (0-100) |
 | `FETCH_ALLOW_PRIVATE` | (unset) | Let repository and status fetches reach private or plain-http hosts (local development only); otherwise only public https hosts are reachable |
@@ -260,6 +260,11 @@ cannot erase handles in bulk. Each resolution holds a database connection only
 around its reads and writes, so throughput scales with
 `HANDLE_RESOLUTION_CONCURRENCY`; point `PLC_URL` at a nearby PLC mirror to keep
 the DID-document lookups fast.
+
+The sweep keeps `HANDLE_RESOLUTION_CONCURRENCY` resolutions in flight and tops
+its queue up as slots free, so a slow lookup (DNS or HTTP timeout) holds one
+slot, not a whole batch. Progress is logged every 30s as
+`handle resolution: <resolved>/<finished> resolved in <n>s (<rate>/s; ...)`.
 
 The sweep needs the partial indexes in
 `migrations/add_actor_handle_sweep_indexes.sql` (built `CONCURRENTLY`; apply
