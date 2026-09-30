@@ -22,6 +22,7 @@ use deadpool_postgres::Pool;
 use futures::FutureExt;
 use futures::stream::{FuturesUnordered, StreamExt};
 use rsky_identity::IdResolver;
+use rsky_identity::handle::HandleResolution;
 use rsky_identity::types::IdentityResolverOpts;
 use rsky_syntax::aturi::AtUri;
 use std::sync::Arc;
@@ -125,7 +126,9 @@ impl IndexerManager {
 
         let id_resolver = IdResolver::new(IdentityResolverOpts {
             timeout: Some(IDENTITY_RESOLVER_TIMEOUT),
-            plc_url: None,
+            // Same PLC directory as the ingester (a local mirror is much faster
+            // than plc.directory and spares it the sweep's load).
+            plc_url: std::env::var("PLC_URL").ok(),
             did_cache: None,
             backup_nameservers: None,
         });
@@ -243,8 +246,7 @@ impl IndexerManager {
                                timestamp: String|
              -> HandleFuture {
                 Box::pin(async move {
-                    let client = pool.get().await.ok()?;
-                    Self::index_handle(&client, &id_resolver, &did, &timestamp, false)
+                    Self::index_handle(&pool, &id_resolver, &did, &timestamp, false)
                         .await
                         .ok()
                 })
@@ -1033,22 +1035,32 @@ impl IndexerManager {
 
     /// Resolve and verify a handle for a DID, updating the actor table.
     /// Returns true if handle was successfully resolved and stored.
+    ///
+    /// Takes the pool rather than a connection: a connection is held only for
+    /// the reads and writes, never across the network lookups (DID document,
+    /// DNS, well-known), so the sweep's concurrency is not capped by its pool.
+    ///
+    /// Only a definitive answer changes the stored handle. A transient failure
+    /// (resolver timeout, well-known 429/5xx, unreachable host) records a try
+    /// and keeps the handle, so a rate limit or an outage upstream can never
+    /// erase handles in bulk.
     pub async fn index_handle(
-        client: &deadpool_postgres::Client,
+        pool: &Pool,
         id_resolver: &Arc<IdResolver>,
         did: &str,
         timestamp: &str,
         force: bool,
     ) -> Result<bool, WintermuteError> {
-        // Check if actor exists and needs reindex
-        let actor_row = client
-            .query_opt(
-                "SELECT handle, \"indexedAt\" FROM actor WHERE did = $1",
-                &[&did],
-            )
-            .await?;
-
         if !force {
+            // Skip actors resolved recently enough.
+            let actor_row = pool
+                .get()
+                .await?
+                .query_opt(
+                    "SELECT handle, \"indexedAt\" FROM actor WHERE did = $1",
+                    &[&did],
+                )
+                .await?;
             if let Some(row) = &actor_row {
                 let current_handle: Option<String> = row.get("handle");
                 let indexed_at: String = row.get("indexedAt");
@@ -1078,12 +1090,12 @@ impl IndexerManager {
                 Ok(Some(doc)) => doc,
                 Ok(None) => {
                     tracing::debug!("DID not found: {did}");
-                    Self::bump_handle_failure(client, did, timestamp).await?;
+                    Self::bump_handle_failure(&pool.get().await?, did, timestamp).await?;
                     return Ok(false);
                 }
                 Err(e) => {
                     tracing::debug!("failed to resolve DID {did}: {e}");
-                    Self::bump_handle_failure(client, did, timestamp).await?;
+                    Self::bump_handle_failure(&pool.get().await?, did, timestamp).await?;
                     return Ok(false);
                 }
             }
@@ -1101,7 +1113,7 @@ impl IndexerManager {
             _ => {
                 tracing::debug!("no handle found in DID document for {did}");
                 // No alsoKnownAs is a definitive negative -- treat as a failed try.
-                Self::bump_handle_failure(client, did, timestamp).await?;
+                Self::bump_handle_failure(&pool.get().await?, did, timestamp).await?;
                 return Ok(false);
             }
         };
@@ -1109,12 +1121,13 @@ impl IndexerManager {
         // Verify bidirectional binding: handle -> DID
         let handle_did = {
             let mut resolver = id_resolver.as_ref().clone();
-            match resolver.handle.resolve(&handle).await {
-                Ok(Some(resolved_did)) => resolved_did,
-                Ok(None) => {
+            match resolver.handle.resolve_outcome(&handle).await {
+                HandleResolution::Found(resolved_did) => resolved_did,
+                HandleResolution::NotFound => {
                     tracing::debug!("handle {handle} does not resolve to a DID");
                     // Handle does not exist -- null it out and record the failure.
-                    client
+                    pool.get()
+                        .await?
                         .execute(
                             "UPDATE actor \
                              SET handle = NULL, \
@@ -1126,9 +1139,9 @@ impl IndexerManager {
                         .await?;
                     return Ok(false);
                 }
-                Err(e) => {
-                    tracing::debug!("failed to resolve handle {handle}: {e}");
-                    Self::bump_handle_failure(client, did, timestamp).await?;
+                HandleResolution::Unavailable(reason) => {
+                    tracing::debug!("could not check handle {handle} now: {reason}");
+                    Self::bump_handle_failure(&pool.get().await?, did, timestamp).await?;
                     return Ok(false);
                 }
             }
@@ -1141,6 +1154,8 @@ impl IndexerManager {
             tracing::debug!("handle {handle} resolves to {handle_did}, expected {did}");
             None
         };
+
+        let client = pool.get().await?;
 
         // Handle contention: if another actor has this handle, remove it
         if let Some(ref h) = verified_handle {

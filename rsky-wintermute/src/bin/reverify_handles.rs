@@ -72,11 +72,16 @@ async fn main() -> Result<()> {
     cfg.manager = Some(ManagerConfig {
         recycling_method: RecyclingMethod::Fast,
     });
+    // Connections are only held around the reads and writes, so a small pool
+    // serves a high --concurrency.
+    cfg.pool = Some(deadpool_postgres::PoolConfig::new(
+        args.concurrency.clamp(1, 16),
+    ));
     let pool = cfg.create_pool(Some(Runtime::Tokio1), NoTls)?;
 
     let id_resolver = Arc::new(IdResolver::new(IdentityResolverOpts {
         timeout: Some(IDENTITY_RESOLVER_TIMEOUT),
-        plc_url: None,
+        plc_url: std::env::var("PLC_URL").ok(),
         did_cache: None,
         backup_nameservers: None,
     }));
@@ -91,14 +96,10 @@ async fn main() -> Result<()> {
             let id_resolver = Arc::clone(&id_resolver);
             let timestamp = timestamp.clone();
             async move {
-                let outcome = match pool.get().await {
-                    Ok(client) => {
-                        IndexerManager::index_handle(&client, &id_resolver, &did, &timestamp, true)
-                            .await
-                            .map_err(|e| e.to_string())
-                    }
-                    Err(e) => Err(e.to_string()),
-                };
+                let outcome =
+                    IndexerManager::index_handle(&pool, &id_resolver, &did, &timestamp, true)
+                        .await
+                        .map_err(|e| e.to_string());
                 (did, outcome)
             }
         })
