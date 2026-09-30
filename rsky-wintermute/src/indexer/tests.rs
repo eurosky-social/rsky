@@ -31,6 +31,17 @@ mod indexer_tests {
             .expect("test pool builds")
     }
 
+    async fn tries_of(client: &deadpool_postgres::Client, did: &str) -> (i16, String) {
+        let row = client
+            .query_one(
+                "SELECT \"handleResolveTries\", \"indexedAt\" FROM actor WHERE did = $1",
+                &[&did],
+            )
+            .await
+            .unwrap();
+        (row.get(0), row.get(1))
+    }
+
     async fn cleanup_test_data(pool: &Pool, did: &str) {
         let client = pool.get().await.unwrap();
 
@@ -3110,5 +3121,118 @@ mod indexer_tests {
         for did in [author, liker] {
             cleanup_test_data(&pool, did).await;
         }
+    }
+
+    // The stale non-NULL sweep must get a share of every batch even when the
+    // NULL-handle backlog alone exceeds the batch (the production shape: tens
+    // of millions of unresolvable NULL rows), so imported-but-unverified
+    // handles (plc_import's 1970-01-01T00:00:01Z marker) are still revisited.
+    #[tokio::test]
+    async fn test_handle_sweep_reserves_share_for_stale_handles() {
+        let (storage, _dir) = setup_test_storage();
+        let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:postgres@localhost:5432/bsky_test".to_owned()
+        });
+        let manager = IndexerManager::new(Arc::new(storage), &database_url).unwrap();
+        let pool = setup_test_pool();
+        let client = pool.get().await.unwrap();
+        let prefix = "did:plc:sweeptest";
+        client
+            .execute(
+                "DELETE FROM actor WHERE did LIKE $1",
+                &[&format!("{prefix}%")],
+            )
+            .await
+            .unwrap();
+
+        let batch = *crate::config::HANDLE_RESOLUTION_BATCH_SIZE;
+        let backlog = i32::try_from(batch + 100).unwrap();
+        client
+            .execute(
+                "INSERT INTO actor (did, \"indexedAt\") \
+                 SELECT $1 || 'null' || g, '1970-01-01T00:00:00Z' FROM generate_series(1, $2) g",
+                &[&prefix, &backlog],
+            )
+            .await
+            .unwrap();
+        let stale: Vec<String> = (0..3).map(|i| format!("{prefix}stale{i}")).collect();
+        for (i, did) in stale.iter().enumerate() {
+            client
+                .execute(
+                    "INSERT INTO actor (did, handle, \"indexedAt\") \
+                     VALUES ($1, $2, '1970-01-01T00:00:01Z')",
+                    &[did, &format!("sweeptest-{i}.example.com")],
+                )
+                .await
+                .unwrap();
+        }
+
+        let (picked, stale_count) = manager
+            .get_actors_needing_handle_resolution()
+            .await
+            .unwrap();
+
+        assert!(picked.len() <= batch, "batch overfilled: {}", picked.len());
+        for did in &stale {
+            assert!(
+                picked.contains(did),
+                "stale handle {did} starved by the NULL backlog"
+            );
+        }
+        assert!(stale_count >= stale.len());
+        // The shared test DB holds other tests' epoch-stamped NULL rows too, so
+        // which NULL rows fill the rest is arbitrary; only that they do matters.
+        assert!(picked.len() > stale_count, "NULL backlog got no slots");
+
+        client
+            .execute(
+                "DELETE FROM actor WHERE did LIKE $1",
+                &[&format!("{prefix}%")],
+            )
+            .await
+            .unwrap();
+    }
+
+    // A failed resolution must record the failure (bump tries, capped) rather
+    // than error: an i16 bound against `LEAST(tries + 1, $n)` (int4) failed to
+    // serialize, so no failure was ever recorded and the backoff never engaged.
+    #[tokio::test]
+    async fn test_bump_handle_failure_increments_and_caps_tries() {
+        let pool = setup_test_pool();
+        let client = pool.get().await.unwrap();
+        let did = "did:plc:bumptest0000000000000000";
+        client
+            .execute("DELETE FROM actor WHERE did = $1", &[&did])
+            .await
+            .unwrap();
+        client
+            .execute(
+                "INSERT INTO actor (did, \"indexedAt\") VALUES ($1, '1970-01-01T00:00:00Z')",
+                &[&did],
+            )
+            .await
+            .unwrap();
+        IndexerManager::bump_handle_failure(&client, did, "2026-01-01T00:00:00.000Z")
+            .await
+            .unwrap();
+        assert_eq!(
+            tries_of(&client, did).await,
+            (1, "2026-01-01T00:00:00.000Z".to_owned())
+        );
+
+        for _ in 0..(crate::config::HANDLE_MAX_TRIES + 3) {
+            IndexerManager::bump_handle_failure(&client, did, "2026-01-02T00:00:00.000Z")
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            tries_of(&client, did).await.0,
+            crate::config::HANDLE_MAX_TRIES
+        );
+
+        client
+            .execute("DELETE FROM actor WHERE did = $1", &[&did])
+            .await
+            .unwrap();
     }
 }

@@ -99,11 +99,25 @@ pub static HANDLE_RESOLUTION_BATCH_SIZE: LazyLock<usize> = LazyLock::new(|| {
 // Priority window for recently-indexed actors (resolve new actors faster)
 pub const HANDLE_PRIORITY_WINDOW: Duration = Duration::from_secs(6 * 60 * 60); // 6 hours
 
-// How often the handle-resolution loop folds in the (much larger) sweep over
-// stale non-NULL handles. Default: every 20th iteration -- the cheap NULL-handle
-// scans run every iteration and dominate the priority queue; the stale-revalidate
-// path only needs to run periodically to catch handle changes.
-pub const HANDLE_STALE_VALID_EVERY_N: u64 = 20;
+// Percent (0-100) of every handle-resolution batch reserved for stale non-NULL
+// handles; the NULL-handle buckets take the rest plus whatever the stale sweep
+// leaves unused. A fixed share rather than an every-Nth-batch cadence: tens of
+// millions of never-resolvable NULL rows keep the NULL buckets permanently
+// non-empty, and handles that were imported but never verified (plc_import
+// stamps them 1970-01-01T00:00:01Z, so they sort first) must still make
+// steady progress instead of waiting behind them. Default: 50.
+pub static HANDLE_STALE_VALID_SHARE: LazyLock<u8> = LazyLock::new(|| {
+    std::env::var("HANDLE_STALE_VALID_SHARE")
+        .ok()
+        .and_then(|s| s.parse::<u8>().ok())
+        .map_or(50, |v| v.min(100))
+});
+
+/// Slots of a `batch_size` batch reserved for stale non-NULL handles.
+#[must_use]
+pub fn stale_valid_quota(batch_size: usize, share_pct: u8) -> usize {
+    batch_size.saturating_mul(usize::from(share_pct.min(100))) / 100
+}
 
 // Cap for `actor.handleResolveTries`. Once a row hits this many failures it is
 // retried at the maximum cooldown (currently 7 days). Fits in SMALLINT.
@@ -629,5 +643,19 @@ mod tests {
         assert_eq!(handle_retry_cooldown(HANDLE_MAX_TRIES), seven_days);
         assert_eq!(handle_retry_cooldown(HANDLE_MAX_TRIES + 5), seven_days);
         assert_eq!(handle_retry_cooldown(i16::MAX), seven_days);
+    }
+
+    #[test]
+    fn stale_valid_quota_is_a_share_of_the_batch() {
+        assert_eq!(stale_valid_quota(500, 50), 250);
+        assert_eq!(stale_valid_quota(500, 0), 0);
+        assert_eq!(stale_valid_quota(500, 100), 500);
+        assert_eq!(stale_valid_quota(3, 50), 1);
+    }
+
+    #[test]
+    fn stale_valid_quota_clamps_share_to_the_batch() {
+        assert_eq!(stale_valid_quota(500, 255), 500);
+        assert_eq!(stale_valid_quota(0, 50), 0);
     }
 }

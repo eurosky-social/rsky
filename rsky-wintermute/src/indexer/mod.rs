@@ -4,8 +4,9 @@ mod tests;
 use crate::SHUTDOWN;
 use crate::config::{
     DB_POOL_SIZE, HANDLE_MAX_TRIES, HANDLE_REINDEX_INTERVAL_INVALID, HANDLE_REINDEX_INTERVAL_VALID,
-    HANDLE_RESOLUTION_BATCH_SIZE, HANDLE_RESOLUTION_CONCURRENCY, HANDLE_STALE_VALID_EVERY_N,
+    HANDLE_RESOLUTION_BATCH_SIZE, HANDLE_RESOLUTION_CONCURRENCY, HANDLE_STALE_VALID_SHARE,
     IDENTITY_RESOLVER_TIMEOUT, INLINE_CONCURRENCY, WORKERS_INDEXER, handle_retry_cooldown,
+    stale_valid_quota,
 };
 use crate::config::{
     FIREHOSE_LIVE_DRAIN_BATCH, FIREHOSE_LIVE_SHARDS, INDEXER_BATCH_SIZE, INDEXER_BATCH_WORKERS,
@@ -206,21 +207,15 @@ impl IndexerManager {
                 break;
             }
 
-            // Run the cheap NULL-handle queries every iteration; fold in the more
-            // expensive "stale non-NULL" sweep only every Nth iteration so the
-            // background loop does not dominate PG IO.
-            let include_stale_valid = batch_count % HANDLE_STALE_VALID_EVERY_N == 0;
-            let dids_to_resolve = match self
-                .get_actors_needing_handle_resolution(include_stale_valid)
-                .await
-            {
-                Ok(dids) => dids,
-                Err(e) => {
-                    tracing::warn!("failed to get actors needing handle resolution: {e}");
-                    tokio::time::sleep(Duration::from_secs(5)).await;
-                    continue;
-                }
-            };
+            let (dids_to_resolve, stale_count) =
+                match self.get_actors_needing_handle_resolution().await {
+                    Ok(picked) => picked,
+                    Err(e) => {
+                        tracing::warn!("failed to get actors needing handle resolution: {e}");
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                        continue;
+                    }
+                };
 
             if dids_to_resolve.is_empty() {
                 // No work to do, sleep longer
@@ -287,7 +282,8 @@ impl IndexerManager {
             // Log progress every 10 batches or when handles are resolved
             if batch_count % 10 == 1 || resolved_count > 0 {
                 tracing::info!(
-                    "handle resolution batch {batch_count}: {resolved_count}/{batch_size} resolved (total: {total_resolved})"
+                    "handle resolution batch {batch_count}: {resolved_count}/{batch_size} resolved (stale={stale_count}, null={}, total: {total_resolved})",
+                    batch_size - stale_count
                 );
             }
 
@@ -296,16 +292,44 @@ impl IndexerManager {
         }
     }
 
+    /// Picks the next batch of actors to (re)resolve. Returns the DIDs and how
+    /// many of them came from the stale non-NULL sweep (they come first).
     async fn get_actors_needing_handle_resolution(
         &self,
-        include_stale_valid: bool,
-    ) -> Result<Vec<String>, WintermuteError> {
+    ) -> Result<(Vec<String>, usize), WintermuteError> {
         let client = self.pool_labels.get().await?;
         let batch_size = *HANDLE_RESOLUTION_BATCH_SIZE;
         let now = chrono::Utc::now();
         let mut dids: Vec<String> = Vec::with_capacity(batch_size);
 
-        // Per-tries bucketed scan. Lower-tries buckets drain first so brand-new
+        // Query A: stale non-NULL handles, oldest first, capped at a fixed share
+        // of the batch (HANDLE_STALE_VALID_SHARE) so they progress however large
+        // the NULL backlog is. Oldest first puts plc_import's never-verified
+        // handles (1970-01-01T00:00:01Z) ahead of routine 24h revalidation.
+        // Served by actor_handle_indexed_at_idx (partial, WHERE handle IS NOT
+        // NULL; migrations/add_actor_handle_sweep_indexes.sql). Without it the
+        // planner walks actor_indexed_at_idx past every NULL row stamped at the
+        // epoch before reaching the first non-NULL one.
+        let stale_quota = stale_valid_quota(batch_size, *HANDLE_STALE_VALID_SHARE);
+        if stale_quota > 0 {
+            let stale_threshold_valid = (now
+                - chrono::Duration::from_std(HANDLE_REINDEX_INTERVAL_VALID).unwrap_or_default())
+            .to_rfc3339();
+            let limit = i64::try_from(stale_quota).unwrap_or(i64::MAX);
+            let stale_rows = client
+                .query(
+                    "SELECT did FROM actor \
+                     WHERE handle IS NOT NULL AND \"indexedAt\" < $1 \
+                     ORDER BY \"indexedAt\" ASC \
+                     LIMIT $2",
+                    &[&stale_threshold_valid, &limit],
+                )
+                .await?;
+            dids.extend(stale_rows.iter().map(|row| row.get::<_, String>("did")));
+        }
+        let stale_count = dids.len();
+
+        // Query B: NULL handles fill the rest of the batch. Per-tries bucketed scan. Lower-tries buckets drain first so brand-new
         // actors (tries=0) always get fastest service. Each bucket's predicate
         // matches `actor_handle_retry_idx (handleResolveTries, indexedAt)
         // WHERE handle IS NULL`, so the scan is index-only.
@@ -337,27 +361,7 @@ impl IndexerManager {
             dids.extend(rows.iter().map(|row| row.get::<_, String>("did")));
         }
 
-        // Query B: stale non-NULL handles. Run only at a slower cadence -- this
-        // path uses actor_indexed_at_idx (full table indexed, much larger) and is
-        // not user-visible, so we don't need it on every iteration.
-        if include_stale_valid {
-            let stale_threshold_valid = (chrono::Utc::now()
-                - chrono::Duration::from_std(HANDLE_REINDEX_INTERVAL_VALID).unwrap_or_default())
-            .to_rfc3339();
-            let limit = i64::try_from(batch_size).unwrap_or(i64::MAX);
-            let stale_rows = client
-                .query(
-                    "SELECT did FROM actor \
-                     WHERE handle IS NOT NULL AND \"indexedAt\" < $1 \
-                     ORDER BY \"indexedAt\" ASC \
-                     LIMIT $2",
-                    &[&stale_threshold_valid, &limit],
-                )
-                .await?;
-            dids.extend(stale_rows.iter().map(|row| row.get::<_, String>("did")));
-        }
-
-        Ok(dids)
+        Ok((dids, stale_count))
     }
 
     /// Bump `handleResolveTries` (capped at `HANDLE_MAX_TRIES`) and refresh
@@ -373,7 +377,7 @@ impl IndexerManager {
             .execute(
                 "UPDATE actor \
                  SET \"indexedAt\" = $2, \
-                     \"handleResolveTries\" = LEAST(\"handleResolveTries\" + 1, $3) \
+                     \"handleResolveTries\" = LEAST(\"handleResolveTries\" + 1, $3::smallint) \
                  WHERE did = $1",
                 &[&did, &timestamp, &HANDLE_MAX_TRIES],
             )
@@ -1115,7 +1119,7 @@ impl IndexerManager {
                             "UPDATE actor \
                              SET handle = NULL, \
                                  \"indexedAt\" = $2, \
-                                 \"handleResolveTries\" = LEAST(\"handleResolveTries\" + 1, $3) \
+                                 \"handleResolveTries\" = LEAST(\"handleResolveTries\" + 1, $3::smallint) \
                              WHERE did = $1",
                             &[&did, &timestamp, &HANDLE_MAX_TRIES],
                         )
@@ -1171,7 +1175,7 @@ impl IndexerManager {
                      ON CONFLICT (did) DO UPDATE SET \
                        handle = NULL, \
                        \"indexedAt\" = EXCLUDED.\"indexedAt\", \
-                       \"handleResolveTries\" = LEAST(actor.\"handleResolveTries\" + 1, $3)",
+                       \"handleResolveTries\" = LEAST(actor.\"handleResolveTries\" + 1, $3::smallint)",
                     &[&did, &timestamp, &HANDLE_MAX_TRIES],
                 )
                 .await?;

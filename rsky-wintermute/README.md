@@ -106,6 +106,9 @@ RUST_LOG=info \
 | `BACKFILLER_TIMEOUT_SECS` | `120` | Timeout for fetching repo CAR from PDS |
 | `INLINE_CONCURRENCY` | `100` | Concurrent inline indexing tasks for firehose events |
 | `DB_POOL_SIZE` | `20` | Connections per pool (4 pools: firehose, labels, indexer, backfiller) |
+| `HANDLE_RESOLUTION_BATCH_SIZE` | `500` | Actors per handle-resolution batch |
+| `HANDLE_RESOLUTION_CONCURRENCY` | `50` | Concurrent handle resolutions within a batch |
+| `HANDLE_STALE_VALID_SHARE` | `50` | Percent of each handle-resolution batch reserved for re-verifying stale non-NULL handles (0-100) |
 | `FETCH_ALLOW_PRIVATE` | (unset) | Let repository and status fetches reach private or plain-http hosts (local development only); otherwise only public https hosts are reachable |
 | `RECONCILE_PDS_URL` | (none) | The PDS `reindex_did` reads frontiers and exports from, as a fixed address |
 | `RECONCILE_PDS_ADMIN_PASSWORD` | (none) | Admin password for the frontier read on that PDS |
@@ -129,6 +132,21 @@ Manually queue DIDs for backfill from various sources:
 # Show queue status
 ./target/release/queue_backfill status
 ```
+
+### reverify_handles
+
+Re-verifies the handles of specific actors now, bypassing the sweep's
+cooldowns and queue order: each DID goes through the same DID document ->
+handle -> bidirectional check as the sweep, and the actor row is updated
+(or the failure recorded). Use it for a reported stale handle instead of
+nudging the account's PDS, which writes a PLC operation per DID.
+
+```bash
+# one DID per line; blank lines and # comments are ignored; `-` (default) reads stdin
+DATABASE_URL=... reverify_handles dids.txt --concurrency 20
+```
+
+Prints `did<TAB>verified|unverified|error: ...` per DID and a summary on stderr.
 
 ### reindex_did
 
@@ -225,7 +243,19 @@ The backfiller implements backpressure via `BACKFILLER_OUTPUT_HIGH_WATER_MARK`. 
 
 ### Handle Resolution
 
-Handles are resolved asynchronously after initial indexing. Actors with NULL handles are prioritized and re-checked every hour. Valid handles are re-verified every 24 hours.
+Handles are resolved asynchronously after initial indexing. Each batch
+reserves `HANDLE_STALE_VALID_SHARE` percent of its slots for handles due for
+re-verification (valid handles every 24 hours, oldest first, so handles
+imported by `plc_import` but never verified, stamped
+`1970-01-01T00:00:01Z`, go first). The rest goes to actors with NULL handles
+in `handleResolveTries` buckets: a never-tried actor is resolved immediately,
+and each failure doubles the wait (1h, 2h, 4h ... capped at 7 days), so DIDs
+that never resolve cannot hold up the queue.
+
+The sweep needs the partial indexes in
+`migrations/add_actor_handle_sweep_indexes.sql` (built `CONCURRENTLY`; apply
+with plain `psql -f`, not in a transaction). Without them each batch selection
+scans past every epoch-stamped NULL row.
 
 ### Graceful Shutdown
 

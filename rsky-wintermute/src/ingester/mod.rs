@@ -1006,7 +1006,7 @@ impl IngesterManager {
                                     .execute(
                                         "UPDATE actor \
                                          SET \"indexedAt\" = $2, \
-                                             \"handleResolveTries\" = LEAST(\"handleResolveTries\" + 1, $3) \
+                                             \"handleResolveTries\" = LEAST(\"handleResolveTries\" + 1, $3::smallint) \
                                          WHERE did = $1",
                                         &[&did, &timestamp, &HANDLE_MAX_TRIES],
                                     )
@@ -1025,7 +1025,7 @@ impl IngesterManager {
                         .execute(
                             "UPDATE actor \
                              SET \"indexedAt\" = $2, \
-                                 \"handleResolveTries\" = LEAST(\"handleResolveTries\" + 1, $3) \
+                                 \"handleResolveTries\" = LEAST(\"handleResolveTries\" + 1, $3::smallint) \
                              WHERE did = $1",
                             &[&did, &timestamp, &HANDLE_MAX_TRIES],
                         )
@@ -1041,7 +1041,7 @@ impl IngesterManager {
                         .execute(
                             "UPDATE actor \
                              SET \"indexedAt\" = $2, \
-                                 \"handleResolveTries\" = LEAST(\"handleResolveTries\" + 1, $3) \
+                                 \"handleResolveTries\" = LEAST(\"handleResolveTries\" + 1, $3::smallint) \
                              WHERE did = $1",
                             &[&did, &timestamp, &HANDLE_MAX_TRIES],
                         )
