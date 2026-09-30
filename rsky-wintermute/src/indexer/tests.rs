@@ -3338,4 +3338,119 @@ mod indexer_tests {
         );
         assert!(done > 0, "the sweep made no progress");
     }
+
+    // A like/repost whose subject strongRef lacks a uri or cid is invalid and
+    // must be dropped on its own. The COPY path rendered the missing cid as ""
+    // under NULL '', so one such record violated subject_cid NOT NULL and
+    // failed every like/repost in its batch, which were then requeued with it
+    // forever (2026-09-30 on the eurosky appview).
+    #[tokio::test]
+    async fn invalid_subject_strong_ref_does_not_fail_the_batch() {
+        use crate::types::{IndexJob, WriteAction};
+
+        let pool = setup_test_pool();
+        let author = "did:plc:wintermute-test-strongref-author";
+        let actor = "did:plc:wintermute-test-strongref-actor";
+        for did in [author, actor] {
+            cleanup_test_data(&pool, did).await;
+        }
+        let client = pool.get().await.unwrap();
+        for did in [author, actor] {
+            client
+                .execute(
+                    "INSERT INTO actor (did, \"indexedAt\") VALUES ($1, NOW()) \
+                     ON CONFLICT (did) DO NOTHING",
+                    &[&did],
+                )
+                .await
+                .unwrap();
+        }
+        drop(client);
+
+        let cid = "bafyreihhl5mpvjkrhnnagen2fomozzhnhhdq2jr6cego2nzbvmwewv5rd4";
+        let ts = "2026-09-30T13:06:35.000Z";
+        let post_uri = format!("at://{author}/app.bsky.feed.post/strongrefpost");
+        let job = |coll: &str, rkey: &str, record: serde_json::Value| IndexJob {
+            uri: format!("at://{actor}/{coll}/{rkey}"),
+            cid: cid.to_owned(),
+            action: WriteAction::Create,
+            record: Some(record),
+            indexed_at: ts.to_owned(),
+            rev: "3a".to_owned(),
+            provenance: None,
+        };
+        let jobs = vec![
+            (
+                b"r1".to_vec(),
+                job(
+                    "app.bsky.feed.repost",
+                    "valid",
+                    serde_json::json!({"$type": "app.bsky.feed.repost", "subject": {"uri": post_uri, "cid": cid}, "createdAt": ts}),
+                ),
+            ),
+            (
+                b"r2".to_vec(),
+                job(
+                    "app.bsky.feed.repost",
+                    "nocid",
+                    serde_json::json!({"$type": "app.bsky.feed.repost", "subject": {"uri": post_uri}, "createdAt": ts}),
+                ),
+            ),
+            (
+                b"l1".to_vec(),
+                job(
+                    "app.bsky.feed.like",
+                    "valid",
+                    serde_json::json!({"$type": "app.bsky.feed.like", "subject": {"uri": post_uri, "cid": cid}, "createdAt": ts}),
+                ),
+            ),
+            (
+                b"l2".to_vec(),
+                job(
+                    "app.bsky.feed.like",
+                    "emptycid",
+                    serde_json::json!({"$type": "app.bsky.feed.like", "subject": {"uri": post_uri, "cid": ""}, "createdAt": ts}),
+                ),
+            ),
+            (
+                b"l3".to_vec(),
+                job(
+                    "app.bsky.feed.like",
+                    "nouri",
+                    serde_json::json!({"$type": "app.bsky.feed.like", "subject": {"cid": cid}, "createdAt": ts}),
+                ),
+            ),
+        ];
+        let (results, batch_failed) =
+            IndexerManager::process_jobs_batch(&pool, &jobs, false, false).await;
+        assert!(!batch_failed, "an invalid strongRef failed the whole batch");
+        for (_, r) in &results {
+            assert!(r.is_ok(), "job failed: {r:?}");
+        }
+
+        let client = pool.get().await.unwrap();
+        for (table, coll, rkey, expect) in [
+            ("repost", "app.bsky.feed.repost", "valid", true),
+            ("repost", "app.bsky.feed.repost", "nocid", false),
+            ("\"like\"", "app.bsky.feed.like", "valid", true),
+            ("\"like\"", "app.bsky.feed.like", "emptycid", false),
+            ("\"like\"", "app.bsky.feed.like", "nouri", false),
+        ] {
+            let uri = format!("at://{actor}/{coll}/{rkey}");
+            let n: i64 = client
+                .query_one(
+                    &format!("SELECT count(*) FROM {table} WHERE uri = $1"),
+                    &[&uri],
+                )
+                .await
+                .unwrap()
+                .get(0);
+            assert_eq!(n == 1, expect, "{uri}");
+        }
+        drop(client);
+
+        for did in [author, actor] {
+            cleanup_test_data(&pool, did).await;
+        }
+    }
 }
