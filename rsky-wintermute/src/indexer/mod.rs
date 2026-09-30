@@ -2887,15 +2887,10 @@ impl IndexerManager {
         for pj in jobs {
             if let Some(record) = &pj.job.record {
                 let uri = pj.uri.to_string();
-                let subject_obj = record.get("subject");
-                let subject_uri = subject_obj
-                    .and_then(|s| s.get("uri"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let subject_cid = subject_obj
-                    .and_then(|s| s.get("cid"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let Some((subject_uri, subject_cid)) = subject_strong_ref(record) else {
+                    tracing::warn!("dropping {uri}: subject strongRef lacks a uri or cid");
+                    continue;
+                };
                 let created_at = record
                     .get("createdAt")
                     .and_then(|v| v.as_str())
@@ -3004,15 +2999,10 @@ impl IndexerManager {
         for pj in jobs {
             if let Some(record) = &pj.job.record {
                 let uri = pj.uri.to_string();
-                let subject_obj = record.get("subject");
-                let subject_uri = subject_obj
-                    .and_then(|s| s.get("uri"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let subject_cid = subject_obj
-                    .and_then(|s| s.get("cid"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let Some((subject_uri, subject_cid)) = subject_strong_ref(record) else {
+                    tracing::warn!("dropping {uri}: subject strongRef lacks a uri or cid");
+                    continue;
+                };
                 let created_at = record
                     .get("createdAt")
                     .and_then(|v| v.as_str())
@@ -3661,15 +3651,10 @@ impl IndexerManager {
         for pj in jobs {
             if let Some(record) = &pj.job.record {
                 let uri = pj.uri.to_string();
-                let subject_obj = record.get("subject");
-                let subject_uri = subject_obj
-                    .and_then(|s| s.get("uri"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let subject_cid = subject_obj
-                    .and_then(|s| s.get("cid"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let Some((subject_uri, subject_cid)) = subject_strong_ref(record) else {
+                    tracing::warn!("dropping {uri}: subject strongRef lacks a uri or cid");
+                    continue;
+                };
                 let created_at = record
                     .get("createdAt")
                     .and_then(|v| v.as_str())
@@ -3874,15 +3859,10 @@ impl IndexerManager {
         for pj in jobs {
             if let Some(record) = &pj.job.record {
                 let uri = pj.uri.to_string();
-                let subject_obj = record.get("subject");
-                let subject_uri = subject_obj
-                    .and_then(|s| s.get("uri"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let subject_cid = subject_obj
-                    .and_then(|s| s.get("cid"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
+                let Some((subject_uri, subject_cid)) = subject_strong_ref(record) else {
+                    tracing::warn!("dropping {uri}: subject strongRef lacks a uri or cid");
+                    continue;
+                };
                 let created_at = record
                     .get("createdAt")
                     .and_then(|v| v.as_str())
@@ -4635,16 +4615,10 @@ impl IndexerManager {
         let uri_obj = AtUri::new(format!("at://{did}/app.bsky.feed.like/{rkey}"), None)
             .map_err(|e| WintermuteError::Other(format!("invalid uri: {e}")))?;
         let uri = uri_obj.to_string();
-        let subject = record
-            .get("subject")
-            .and_then(|v| v.get("uri"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let subject_cid = record
-            .get("subject")
-            .and_then(|v| v.get("cid"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let Some((subject, subject_cid)) = subject_strong_ref(record) else {
+            tracing::warn!("dropping {uri}: subject strongRef lacks a uri or cid");
+            return Ok(());
+        };
         let created_at = record
             .get("createdAt")
             .and_then(|v| v.as_str())
@@ -4874,16 +4848,10 @@ impl IndexerManager {
         let uri_obj = AtUri::new(format!("at://{did}/app.bsky.feed.repost/{rkey}"), None)
             .map_err(|e| WintermuteError::Other(format!("invalid uri: {e}")))?;
         let uri = uri_obj.to_string();
-        let subject = record
-            .get("subject")
-            .and_then(|v| v.get("uri"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let subject_cid = record
-            .get("subject")
-            .and_then(|v| v.get("cid"))
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
+        let Some((subject, subject_cid)) = subject_strong_ref(record) else {
+            tracing::warn!("dropping {uri}: subject strongRef lacks a uri or cid");
+            return Ok(());
+        };
         let created_at = record
             .get("createdAt")
             .and_then(|v| v.as_str())
@@ -5850,4 +5818,16 @@ impl SweepWindow {
         *self = Self::new();
         Some(line)
     }
+}
+
+/// A like/repost subject strongRef as (uri, cid), or None when either is
+/// missing or empty. Such a record is invalid (a strongRef requires both) and
+/// is dropped: the COPY path rendered the missing cid as `""` under `NULL ''`, so
+/// one such record violated `subject_cid NOT NULL` and failed every like/repost
+/// in its batch, requeued with it indefinitely.
+fn subject_strong_ref(record: &serde_json::Value) -> Option<(&str, &str)> {
+    let subject = record.get("subject")?;
+    let uri = subject.get("uri")?.as_str().filter(|v| !v.is_empty())?;
+    let cid = subject.get("cid")?.as_str().filter(|v| !v.is_empty())?;
+    Some((uri, cid))
 }
