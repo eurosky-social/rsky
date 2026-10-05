@@ -148,6 +148,40 @@ DATABASE_URL=... reverify_handles dids.txt --concurrency 20
 
 Prints `did<TAB>verified|unverified|error: ...` per DID and a summary on stderr.
 
+### firehose_catchup
+
+Replays ranges of relay sequence numbers straight into the indexer, to fill
+gaps the live subscription missed. It leaves the live cursor and the queues
+alone and every write is rev-guarded, so it can run beside the live instance.
+
+```bash
+# START:END are both exclusive: the last seq received before the gap and the
+# first one received after it. Sequence numbers must be --relay-host's own.
+DATABASE_URL=... firehose_catchup --relay-host relay.example \
+  --range 34100000:34160000 --range 34300000:34310000
+```
+
+A gap can also be given by time, for a relay that numbers its events
+differently from the one the gap was seen on:
+
+```bash
+# SINCE/UNTIL in RFC 3339; the cursors are found by probing --relay-host.
+# Each window is widened by --window-padding-secs (default 300) on both sides.
+DATABASE_URL=... firehose_catchup --relay-host bsky.network \
+  --window 2026-10-05T15:45:00Z/2026-10-05T15:55:00Z
+```
+
+`--resolve-only` prints the `--range` of each window and exits without
+touching the database.
+
+Replayed records are stamped with the time of their event, not the time of
+the replay. Commits are indexed, account events are applied (guarded by their time), and
+identity and sync events re-resolve the actor's current handle. A dropped
+connection resumes from the last event received. The exit status is non-zero
+when a write failed or a range was not fully replayed; a range that starts
+before the relay's replay window fails unless `--allow-partial` is passed, and a
+range the relay delivers nothing for counts as not replayed.
+
 ### reindex_did
 
 Reconciles one actor's downstream state against its repository under a
