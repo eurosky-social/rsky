@@ -11,7 +11,7 @@ use crate::storage::Storage;
 use crate::types::{CommitData, FirehoseEvent, IndexJob, WintermuteError, WriteAction};
 use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use futures::SinkExt;
-use futures::stream::StreamExt;
+use futures::stream::{FuturesUnordered, StreamExt};
 use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
@@ -25,7 +25,18 @@ enum ConnectionResult {
     Closed,
     Error(WintermuteError),
     FutureCursor,
+    /// The live queue kept rejecting an event; reconnecting cannot fix that.
+    EnqueueFailed(WintermuteError),
 }
+
+/// Waits between attempts to enqueue a job the live queue rejected. The relay
+/// cursor is held on the previous event for the whole sequence.
+const ENQUEUE_RETRY_DELAYS: [Duration; 4] = [
+    Duration::from_millis(100),
+    Duration::from_millis(500),
+    Duration::from_secs(2),
+    Duration::from_secs(5),
+];
 
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
@@ -69,7 +80,7 @@ impl IngesterManager {
 
         rt.block_on(async {
             // Long-running tasks that should keep the ingester alive
-            let mut persistent_tasks = Vec::new();
+            let mut persistent_tasks = FuturesUnordered::new();
 
             for host in &self.relay_hosts {
                 let storage = Arc::clone(&self.storage);
@@ -77,7 +88,7 @@ impl IngesterManager {
                 let db_url = self.database_url.clone();
 
                 let firehose_task = tokio::spawn(async move {
-                    Self::run_connection(Arc::clone(&storage), host_clone.clone(), db_url).await;
+                    Self::run_connection(Arc::clone(&storage), host_clone.clone(), db_url).await
                 });
                 persistent_tasks.push(firehose_task);
 
@@ -109,6 +120,7 @@ impl IngesterManager {
                     if let Err(e) = labels::subscribe_labels(storage, host, db_url).await {
                         tracing::error!("label subscription failed: {e}");
                     }
+                    Ok(())
                 });
 
                 persistent_tasks.push(task);
@@ -117,15 +129,22 @@ impl IngesterManager {
             // Only await persistent tasks (firehose + labels).
             // The ingester stays alive as long as any persistent task is running.
             // Backfill enumeration runs independently and its completion is harmless.
-            for task in persistent_tasks {
-                drop(task.await);
+            // A firehose task only returns an error when the live queue is unusable:
+            // fail the ingester so the process exits non-zero and gets restarted.
+            while let Some(joined) = persistent_tasks.next().await {
+                if let Ok(Err(e)) = joined {
+                    return Err(e);
+                }
             }
-        });
-
-        Ok(())
+            Ok(())
+        })
     }
 
-    async fn run_connection(storage: Arc<Storage>, hostname: String, database_url: String) {
+    async fn run_connection(
+        storage: Arc<Storage>,
+        hostname: String,
+        database_url: String,
+    ) -> Result<(), WintermuteError> {
         // Create postgres pool for cursor storage AND direct indexing
         let pool_size = *DB_POOL_SIZE;
         tracing::info!("firehose DB pool size: {pool_size}");
@@ -140,7 +159,7 @@ impl IngesterManager {
             Ok(p) => Arc::new(p),
             Err(e) => {
                 tracing::error!("failed to create firehose pool: {e}");
-                return;
+                return Ok(());
             }
         };
 
@@ -205,8 +224,16 @@ impl IngesterManager {
                     // Reset backoff since we're intentionally reconnecting with new state
                     backoff_secs = 1;
                 }
+                ConnectionResult::EnqueueFailed(e) => {
+                    tracing::error!(
+                        "live queue rejected an event from {hostname}, stopping the ingester \
+                         with the cursor held before it: {e}"
+                    );
+                    return Err(e);
+                }
             }
         }
+        Ok(())
     }
 
     async fn connect_and_stream(
@@ -515,17 +542,34 @@ impl IngesterManager {
                                     None
                                 }
                             };
-                        for mut job in jobs {
+                        let mut jobs = jobs;
+                        for job in &mut jobs {
                             job.provenance = Some(crate::reconcile::Provenance {
                                 generation,
                                 source: crate::reconcile::Source::Firehose { seq: event.seq },
                             });
-                            if let Err(e) = storage.enqueue_firehose_live(&job) {
-                                tracing::error!("failed to enqueue firehose_live job: {e}");
-                                metrics::INGESTER_ERRORS_TOTAL
-                                    .with_label_values(&["enqueue_failed"])
-                                    .inc();
+                        }
+                        if let Err(e) = Self::enqueue_event_jobs(
+                            &jobs,
+                            event.seq,
+                            &last_seq,
+                            &ENQUEUE_RETRY_DELAYS,
+                            |job| storage.enqueue_firehose_live(job),
+                        )
+                        .await
+                        {
+                            // last_seq still names the last fully enqueued event, so
+                            // the restart replays this one.
+                            let final_seq = last_seq.load(Ordering::Relaxed);
+                            if final_seq > 0 {
+                                drop(set_cursor_in_postgres(pool, &cursor_key, final_seq).await);
                             }
+                            metrics::INGESTER_WEBSOCKET_CONNECTIONS
+                                .with_label_values(&["firehose"])
+                                .dec();
+                            ping_task.abort();
+                            cursor_saver_task.abort();
+                            return ConnectionResult::EnqueueFailed(e);
                         }
                     }
                     Err(e) => {
@@ -533,12 +577,10 @@ impl IngesterManager {
                         metrics::INGESTER_ERRORS_TOTAL
                             .with_label_values(&["parse_failed"])
                             .inc();
+                        // Unparseable on every replay: move past it.
+                        last_seq.store(event.seq, Ordering::Relaxed);
                     }
                 }
-
-                // Atomically update last_seq (cheap, lock-free operation)
-                // The cursor_saver_task will persist this to postgres on interval
-                last_seq.store(event.seq, Ordering::Relaxed);
             }
         }
 
@@ -556,6 +598,40 @@ impl IngesterManager {
         ping_task.abort();
         cursor_saver_task.abort();
         ConnectionResult::Closed
+    }
+
+    /// Enqueue every job of the event `seq`, then advance `last_seq` to it.
+    /// The `cursor_saver_task` persists `last_seq` on an interval, so it must
+    /// never name an event whose jobs are not all in the queue: a rejected job
+    /// is retried after each of `retry_delays`, and when it still fails
+    /// `last_seq` is left untouched and the error returned.
+    pub(crate) async fn enqueue_event_jobs(
+        jobs: &[IndexJob],
+        seq: i64,
+        last_seq: &AtomicI64,
+        retry_delays: &[Duration],
+        enqueue: impl Fn(&IndexJob) -> Result<(), WintermuteError>,
+    ) -> Result<(), WintermuteError> {
+        for job in jobs {
+            let mut delays = retry_delays.iter();
+            while let Err(e) = enqueue(job) {
+                crate::metrics::INGESTER_ERRORS_TOTAL
+                    .with_label_values(&["enqueue_failed"])
+                    .inc();
+                let Some(delay) = delays.next() else {
+                    tracing::error!(
+                        "failed to enqueue firehose_live job for seq={seq}, giving up: {e}"
+                    );
+                    return Err(e);
+                };
+                tracing::error!(
+                    "failed to enqueue firehose_live job for seq={seq}, retrying in {delay:?}: {e}"
+                );
+                tokio::time::sleep(*delay).await;
+            }
+        }
+        last_seq.store(seq, Ordering::Relaxed);
+        Ok(())
     }
 
     pub fn parse_message(data: &[u8]) -> Result<ParseResult, WintermuteError> {

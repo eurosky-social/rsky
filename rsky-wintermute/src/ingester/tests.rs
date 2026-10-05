@@ -821,6 +821,89 @@ mod ingester_tests {
         );
     }
 
+    fn live_job(rkey: &str) -> crate::types::IndexJob {
+        crate::types::IndexJob {
+            uri: format!("at://did:plc:test123/app.bsky.feed.post/{rkey}"),
+            cid: "bafyreihzwnyumvubacqyflkxpsejegc6sxwkcaxv3iwm3lrn3x45gxkioa".to_owned(),
+            action: crate::types::WriteAction::Delete,
+            record: None,
+            indexed_at: "2024-01-01T00:00:00Z".to_owned(),
+            rev: "rev-abc".to_owned(),
+            provenance: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_enqueue_holds_the_cursor_before_the_event() {
+        use crate::types::WintermuteError;
+        use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
+        use std::time::Duration;
+
+        let (storage, _dir) = setup_test_storage();
+        let last_seq = AtomicI64::new(0);
+        let delays = [Duration::from_millis(1); 2];
+
+        // seq 100 enqueues cleanly and moves the cursor
+        IngesterManager::enqueue_event_jobs(&[live_job("a")], 100, &last_seq, &delays, |job| {
+            storage.enqueue_firehose_live(job)
+        })
+        .await
+        .unwrap();
+        assert_eq!(last_seq.load(Ordering::Relaxed), 100);
+
+        // seq 101: the queue takes the first job, then rejects the second for good
+        let attempts = AtomicUsize::new(0);
+        let result = IngesterManager::enqueue_event_jobs(
+            &[live_job("b"), live_job("c")],
+            101,
+            &last_seq,
+            &delays,
+            |job| {
+                if job.uri.ends_with("/c") {
+                    attempts.fetch_add(1, Ordering::Relaxed);
+                    return Err(WintermuteError::Io(std::io::Error::other("disk full")));
+                }
+                storage.enqueue_firehose_live(job)
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        // one initial attempt plus one per retry delay
+        assert_eq!(attempts.load(Ordering::Relaxed), 3);
+        // the cursor a restart resumes from still precedes the failed event
+        assert_eq!(last_seq.load(Ordering::Relaxed), 100);
+    }
+
+    #[tokio::test]
+    async fn transient_enqueue_failure_is_retried_without_losing_the_event() {
+        use crate::types::WintermuteError;
+        use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+        use std::time::Duration;
+
+        let (storage, _dir) = setup_test_storage();
+        let last_seq = AtomicI64::new(100);
+        let failed_once = AtomicBool::new(false);
+
+        IngesterManager::enqueue_event_jobs(
+            &[live_job("a"), live_job("b")],
+            101,
+            &last_seq,
+            &[Duration::from_millis(1)],
+            |job| {
+                if !failed_once.swap(true, Ordering::Relaxed) {
+                    return Err(WintermuteError::Io(std::io::Error::other("transient")));
+                }
+                storage.enqueue_firehose_live(job)
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(storage.firehose_live_len().unwrap(), 2);
+        assert_eq!(last_seq.load(Ordering::Relaxed), 101);
+    }
+
     #[tokio::test]
     async fn test_event_to_index_jobs_conversion() {
         use crate::types::{CommitData, FirehoseEvent, RepoOp};
