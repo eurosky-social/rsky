@@ -1028,7 +1028,7 @@ impl IngesterManager {
     }
 
     /// Process an identity event by resolving the DID and updating the actor table
-    async fn process_identity_event(
+    pub async fn process_identity_event(
         pool: &Pool,
         did: &str,
         timestamp: &str,
@@ -1151,7 +1151,7 @@ impl IngesterManager {
     }
 
     /// Process an account event by updating the actor's upstream status
-    async fn process_account_event(
+    pub async fn process_account_event(
         pool: &Pool,
         did: &str,
         time: &str,
@@ -1226,7 +1226,7 @@ impl IngesterManager {
     /// Used to filter out `#account active:false` events emitted by a PDS the actor has
     /// already migrated away from. The relay forwards them unaware of the migration; the
     /// PLC log is the authoritative answer.
-    async fn pds_says_active(did: &str) -> Option<bool> {
+    pub async fn pds_says_active(did: &str) -> Option<bool> {
         use rsky_identity::IdResolver;
         use rsky_identity::types::IdentityResolverOpts;
         let resolver = IdResolver::new(IdentityResolverOpts {
@@ -1345,7 +1345,7 @@ pub fn relay_http_endpoint(hostname: &str) -> (&'static str, &str) {
 
 /// The firehose endpoint of a relay host, over the websocket form of the
 /// scheme [`relay_http_endpoint`] chose.
-fn subscribe_url(hostname: &str) -> Result<url::Url, url::ParseError> {
+pub fn subscribe_url(hostname: &str) -> Result<url::Url, url::ParseError> {
     let (scheme, host) = match relay_http_endpoint(hostname) {
         ("http", host) => ("ws", host),
         (_, host) => ("wss", host),
