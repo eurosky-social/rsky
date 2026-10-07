@@ -193,7 +193,7 @@ replay window, but it only finds posts something else references.
 
 ```bash
 # --window is on the referencing posts' sortAt; it is scanned in
-# --chunk-minutes (default 60) slices. --dry-run fetches without indexing.
+# --chunk-minutes (default 10) slices. --dry-run fetches without indexing.
 DATABASE_URL=... repair_missing_posts --dry-run \
   --window 2026-10-02T14:00:00Z/2026-10-03T02:00:00Z
 ```

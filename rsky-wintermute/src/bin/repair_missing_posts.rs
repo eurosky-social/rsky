@@ -78,8 +78,10 @@ struct Args {
     #[arg(long = "window", value_parser = parse_window, value_delimiter = ',', required = true)]
     windows: Vec<TimeWindow>,
 
-    /// Each window is scanned in chunks of this many minutes.
-    #[arg(long, default_value = "60")]
+    /// Each window is scanned in chunks of this many minutes. Production
+    /// connections carry a statement timeout, and an hour of posts after a
+    /// large gap exceeded it.
+    #[arg(long, default_value = "10")]
     chunk_minutes: u32,
 
     /// Fetch the posts and report, without indexing anything.
