@@ -182,6 +182,29 @@ when a write failed or a range was not fully replayed; a range that starts
 before the relay's replay window fails unless `--allow-partial` is passed, and a
 range the relay delivers nothing for counts as not replayed.
 
+### repair_missing_posts
+
+Fetches and indexes posts the appview is missing although other posts
+reference them: the reply parents, reply roots and quoted posts of the posts
+sorted in a window that are not in `post`. Clients show such a post as
+deleted. Each one is read from its author's PDS with
+`com.atproto.sync.getRecord`, so this works for gaps older than any relay's
+replay window, but it only finds posts something else references.
+
+```bash
+# --window is on the referencing posts' sortAt; it is scanned in
+# --chunk-minutes (default 10) slices. --dry-run fetches without indexing.
+DATABASE_URL=... repair_missing_posts --dry-run \
+  --window 2026-10-02T14:00:00Z/2026-10-03T02:00:00Z
+```
+
+Prints `uri<TAB>outcome<TAB>detail` per post on stdout: `repaired` (or
+`would-repair`), `deleted` when the PDS proves the record absent,
+`unavailable` for a deactivated or taken-down repository, `unresolvable`,
+`fetch-failed` or `write-failed`. A summary goes to stderr, and the exit status
+is non-zero only when an indexing write failed. Repaired posts are stamped
+with their `createdAt` (capped at now) as `indexedAt`.
+
 ### reindex_did
 
 Reconciles one actor's downstream state against its repository under a

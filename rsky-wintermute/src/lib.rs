@@ -45,6 +45,7 @@ pub mod metrics;
 pub mod outbound;
 pub mod queue_log;
 pub mod reconcile;
+pub mod repair;
 pub mod storage;
 pub mod types;
 
