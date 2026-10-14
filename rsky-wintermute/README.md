@@ -106,6 +106,7 @@ RUST_LOG=info \
 | `BACKFILLER_TIMEOUT_SECS` | `120` | Timeout for fetching repo CAR from PDS |
 | `INLINE_CONCURRENCY` | `100` | Concurrent inline indexing tasks for firehose events |
 | `DB_POOL_SIZE` | `20` | Connections per pool (4 pools: firehose, labels, indexer, backfiller) |
+| `DB_CONN_MAX_AGE_SECS` | `21600` | Retire pooled indexer connections after this age (up to 10% earlier, jittered); their `_bulk_*` temp tables otherwise pin XID wraparound. `0` disables |
 | `HANDLE_RESOLUTION_BATCH_SIZE` | `500` | Actors the handle sweep selects per top-up of its queue |
 | `HANDLE_RESOLUTION_CONCURRENCY` | `50` | Concurrent handle resolutions within a batch |
 | `HANDLE_STALE_VALID_SHARE` | `50` | Percent of each handle-resolution batch reserved for re-verifying stale non-NULL handles (0-100) |

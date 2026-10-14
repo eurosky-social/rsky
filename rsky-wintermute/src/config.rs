@@ -318,6 +318,86 @@ pub fn pg_pool_config(max_size: usize) -> deadpool_postgres::PoolConfig {
     }
 }
 
+// Pooled connection lifetime. Every connection from `create_pg_pool` holds the bulk
+// indexer's TEMP staging tables for as long as it lives, and autovacuum cannot freeze
+// another session's temp tables: their relfrozenxid only moves when the owning session
+// truncates them (a new relfilenode) or disconnects. A connection that sits idle in a
+// pool therefore pins the database's datfrozenxid at its connect time, and at ~2.9k
+// XIDs/s the appview database reached the wraparound stop ~8.5 days after wintermute
+// started (2026-10-14). Retiring connections after a bounded age caps how far that pin
+// can fall behind: 6h is ~63M XIDs at that rate, well under autovacuum_freeze_max_age
+// (200M). Keep it there; 0 disables the cap, which restores the hazard.
+const DEFAULT_DB_CONN_MAX_AGE_SECS: u64 = 6 * 60 * 60;
+
+/// Retire connections up to this fraction (per mille) before `DB_CONN_MAX_AGE`, so a pool
+/// whose connections were all opened at startup does not reconnect in one burst.
+const DB_CONN_MAX_AGE_JITTER_PER_MILLE: u32 = 100;
+
+/// How often idle connections are checked against `DB_CONN_MAX_AGE`. Checkout only
+/// sees the connection it hands out, so a pool nobody draws from needs this sweep.
+const DB_CONN_SWEEP_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Maximum lifetime of a pooled connection; [`None`] (`DB_CONN_MAX_AGE_SECS=0`) disables it.
+pub static DB_CONN_MAX_AGE: LazyLock<Option<Duration>> =
+    LazyLock::new(|| timeout_from_env("DB_CONN_MAX_AGE_SECS", DEFAULT_DB_CONN_MAX_AGE_SECS));
+
+/// Age at which a connection is retired: `max_age` shortened by a jitter in
+/// `[0, max_age * DB_CONN_MAX_AGE_JITTER_PER_MILLE / 1000)` picked by `seed`. The result
+/// never exceeds `max_age`, so the cap stays a hard bound.
+#[must_use]
+fn conn_retire_age(max_age: Duration, seed: u64) -> Duration {
+    let jitter_per_million =
+        u32::try_from(seed % 1000).unwrap_or(0) * DB_CONN_MAX_AGE_JITTER_PER_MILLE;
+    let jitter = max_age
+        .checked_mul(jitter_per_million)
+        .map_or(Duration::ZERO, |d| d / 1_000_000);
+    max_age.saturating_sub(jitter)
+}
+
+/// Whether a connection of this `age` has outlived its jittered `max_age`.
+#[must_use]
+fn conn_expired(max_age: Option<Duration>, age: Duration, seed: u64) -> bool {
+    max_age.is_some_and(|max_age| age >= conn_retire_age(max_age, seed))
+}
+
+/// Per-connection jitter seed. `created` is fixed for a connection's life, so the same
+/// connection always gets the same retire age at checkout and in the sweep.
+fn conn_jitter_seed(metrics: &deadpool_postgres::Metrics) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    metrics.created.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn pooled_conn_expired(max_age: Option<Duration>, metrics: &deadpool_postgres::Metrics) -> bool {
+    conn_expired(max_age, metrics.age(), conn_jitter_seed(metrics))
+}
+
+/// Periodically drop idle connections past `max_age`; exits once the pool is dropped.
+fn spawn_conn_sweeper(pool: &deadpool_postgres::Pool, max_age: Duration, every: Duration) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        // Only checkout enforces the cap then; every caller today runs inside Tokio.
+        tracing::warn!("no Tokio runtime: idle pooled connections are not age-capped");
+        return;
+    };
+    let weak = pool.weak();
+    runtime.spawn(async move {
+        let mut tick = tokio::time::interval(every);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tick.tick().await;
+            let Some(pool) = weak.upgrade() else { break };
+            let removed = pool
+                .retain(|_, metrics| !pooled_conn_expired(Some(max_age), &metrics))
+                .removed
+                .len();
+            if removed > 0 {
+                tracing::debug!("retired {removed} idle pooled connections past {max_age:?}");
+            }
+        }
+    });
+}
+
 /// Session setup run once per pooled connection, before any staging DDL.
 ///
 /// `client_min_messages=warning` is required because the bulk indexer issues
@@ -339,9 +419,27 @@ pub const SESSION_SETUP_SQL: &str = "SET client_min_messages TO warning;";
 /// The staging-table DDL runs once per connection in a `post_create` hook instead of on
 /// every batch. Pools that reach those functions must be built here or they fail with
 /// `undefined_table`; a pool built any other way has no staging tables.
+///
+/// Because those temp tables live as long as the connection, connections are retired
+/// after [`DB_CONN_MAX_AGE`] (see there): on checkout by a `pre_recycle` hook, and while
+/// idle by a background sweep, which needs a Tokio runtime at build time.
 pub fn create_pg_pool(
     database_url: &str,
     pool_config: deadpool_postgres::PoolConfig,
+) -> Result<deadpool_postgres::Pool, crate::types::WintermuteError> {
+    build_pg_pool(
+        database_url,
+        pool_config,
+        *DB_CONN_MAX_AGE,
+        DB_CONN_SWEEP_INTERVAL,
+    )
+}
+
+fn build_pg_pool(
+    database_url: &str,
+    pool_config: deadpool_postgres::PoolConfig,
+    max_age: Option<Duration>,
+    sweep_every: Duration,
 ) -> Result<deadpool_postgres::Pool, crate::types::WintermuteError> {
     use crate::types::WintermuteError;
 
@@ -352,9 +450,20 @@ pub fn create_pg_pool(
     });
     cfg.pool = Some(pool_config);
 
-    cfg.builder(deadpool_postgres::tokio_postgres::NoTls)
+    let pool = cfg
+        .builder(deadpool_postgres::tokio_postgres::NoTls)
         .map_err(|e| WintermuteError::Other(format!("pool config invalid: {e}")))?
         .runtime(deadpool_postgres::Runtime::Tokio1)
+        // A failing pre_recycle hook makes deadpool drop the connection and hand out
+        // another idle one or open a fresh one; the caller never sees the error.
+        .pre_recycle(deadpool_postgres::Hook::sync_fn(move |_, metrics| {
+            if pooled_conn_expired(max_age, metrics) {
+                return Err(deadpool_postgres::HookError::message(
+                    "connection reached its maximum age",
+                ));
+            }
+            Ok(())
+        }))
         .post_recycle(deadpool_postgres::Hook::async_fn(|client, _| {
             Box::pin(async move {
                 client
@@ -393,7 +502,11 @@ pub fn create_pg_pool(
             })
         }))
         .build()
-        .map_err(|e| WintermuteError::Other(format!("pool creation failed: {e}")))
+        .map_err(|e| WintermuteError::Other(format!("pool creation failed: {e}")))?;
+    if let Some(max_age) = max_age {
+        spawn_conn_sweeper(&pool, max_age, sweep_every);
+    }
+    Ok(pool)
 }
 
 // Backfiller direct write mode - bypass the firehose_backfill queue and write directly to PostgreSQL
@@ -605,6 +718,154 @@ mod tests {
         assert_eq!(cfg.timeouts.wait, pg_pool_timeouts().wait);
         assert_eq!(cfg.timeouts.create, pg_pool_timeouts().create);
         assert_eq!(cfg.timeouts.recycle, pg_pool_timeouts().recycle);
+    }
+
+    #[test]
+    fn conn_max_age_defaults_to_six_hours() {
+        // Unset in the test process.
+        assert_eq!(*DB_CONN_MAX_AGE, Some(Duration::from_secs(6 * 60 * 60)));
+    }
+
+    #[test]
+    fn conn_retire_age_is_jittered_within_ten_percent_below_max() {
+        let max = Duration::from_secs(6 * 60 * 60);
+        assert_eq!(conn_retire_age(max, 0), max);
+        assert_eq!(conn_retire_age(max, 1000), max);
+        assert_eq!(conn_retire_age(max, 500), max - max / 20);
+        let earliest = conn_retire_age(max, 999);
+        assert!(earliest < max);
+        assert!(earliest > max - max / 10);
+        for seed in [1, 7, 123, 999, u64::MAX] {
+            let age = conn_retire_age(max, seed);
+            assert!(age <= max && age > max - max / 10, "seed {seed}: {age:?}");
+        }
+    }
+
+    #[test]
+    fn conn_retire_age_survives_extreme_max_age() {
+        // DB_CONN_MAX_AGE_SECS is operator input; a huge value must not panic.
+        let huge = Duration::from_secs(u64::MAX);
+        assert!(conn_retire_age(huge, 999) <= huge);
+        assert_eq!(conn_retire_age(Duration::ZERO, 999), Duration::ZERO);
+    }
+
+    #[test]
+    fn conn_expired_never_when_cap_disabled() {
+        assert!(!conn_expired(None, Duration::from_secs(30 * 24 * 3600), 0));
+    }
+
+    #[test]
+    fn conn_expired_at_the_jittered_age() {
+        let max = Some(Duration::from_secs(3600));
+        // Seed 0: no jitter, retired exactly at max.
+        assert!(!conn_expired(max, Duration::from_secs(3599), 0));
+        assert!(conn_expired(max, Duration::from_secs(3600), 0));
+        // Seed 500: 5% early.
+        assert!(!conn_expired(max, Duration::from_secs(3419), 500));
+        assert!(conn_expired(max, Duration::from_secs(3420), 500));
+        // Every seed retires by max: the cap is a hard bound.
+        for seed in 0..1000 {
+            assert!(conn_expired(max, Duration::from_secs(3600), seed));
+        }
+    }
+
+    #[test]
+    fn conn_jitter_seed_is_stable_per_connection_and_spreads() {
+        let a = deadpool_postgres::Metrics::default();
+        // Same connection metrics, same seed at checkout and in the sweep.
+        assert_eq!(conn_jitter_seed(&a), conn_jitter_seed(&a));
+        let max = Duration::from_secs(6 * 60 * 60);
+        let start = std::time::Instant::now();
+        let ages: std::collections::HashSet<Duration> = (0..64u32)
+            .map(|i| {
+                let m = deadpool_postgres::Metrics {
+                    created: start + Duration::from_nanos(u64::from(i)),
+                    ..Default::default()
+                };
+                conn_retire_age(max, conn_jitter_seed(&m))
+            })
+            .collect();
+        // Connections opened together must not all be retired at the same instant.
+        assert!(ages.len() > 32, "only {} distinct retire ages", ages.len());
+    }
+
+    fn test_database_url() -> String {
+        std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:postgres@localhost:5432/bsky_test".to_owned()
+        })
+    }
+
+    async fn backend_pid(pool: &deadpool_postgres::Pool) -> i32 {
+        let client = pool.get().await.unwrap();
+        // The staging tables must exist on every connection, including replacements.
+        client
+            .batch_execute("SELECT 1 FROM _bulk_post LIMIT 0")
+            .await
+            .unwrap();
+        client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap()
+            .get(0)
+    }
+
+    #[tokio::test]
+    async fn expired_connection_is_replaced_on_checkout() {
+        // Sweep far in the future so only the pre_recycle hook can act.
+        let pool = build_pg_pool(
+            &test_database_url(),
+            pg_pool_config(1),
+            Some(Duration::from_millis(300)),
+            Duration::from_secs(3600),
+        )
+        .unwrap();
+        let first = backend_pid(&pool).await;
+        assert_eq!(
+            backend_pid(&pool).await,
+            first,
+            "young connection is reused"
+        );
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let second = backend_pid(&pool).await;
+        assert_ne!(second, first, "expired connection must be replaced");
+        assert_eq!(pool.status().size, 1);
+    }
+
+    #[tokio::test]
+    async fn idle_expired_connections_are_swept() {
+        let pool = build_pg_pool(
+            &test_database_url(),
+            pg_pool_config(3),
+            Some(Duration::from_millis(300)),
+            Duration::from_millis(100),
+        )
+        .unwrap();
+        {
+            let (a, b, c) = tokio::join!(pool.get(), pool.get(), pool.get());
+            drop((a.unwrap(), b.unwrap(), c.unwrap()));
+        }
+        assert_eq!(pool.status().size, 3);
+        // Nobody checks out: only the sweeper can close them.
+        tokio::time::sleep(Duration::from_millis(700)).await;
+        assert_eq!(
+            pool.status().size,
+            0,
+            "idle expired connections must be closed"
+        );
+    }
+
+    #[tokio::test]
+    async fn disabled_cap_keeps_connections() {
+        let pool = build_pg_pool(
+            &test_database_url(),
+            pg_pool_config(1),
+            None,
+            Duration::from_millis(50),
+        )
+        .unwrap();
+        let first = backend_pid(&pool).await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(backend_pid(&pool).await, first);
     }
 
     #[test]
