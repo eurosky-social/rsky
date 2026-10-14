@@ -7,7 +7,8 @@
 //! queries per second for the single PLC host name. Every transport in this
 //! crate resolves through [`shared`] instead, which
 //!
-//! - keeps one hickory cache, so a name costs one lookup per TTL;
+//! - keeps one hickory cache, so a name costs one lookup per TTL (at least
+//!   [`MIN_POSITIVE_TTL`]);
 //! - lets only one lookup per name be in flight, the other callers wait for
 //!   its answer, so a cold or expired entry is not fetched once per waiting
 //!   connection;
@@ -33,6 +34,11 @@ pub const FAILURE_MEMO: Duration = Duration::from_secs(1);
 
 /// How often, at most, the resolver configuration file is checked.
 pub const RELOAD_CHECK: Duration = Duration::from_secs(5);
+
+/// The shortest time a positive answer is cached, whatever its TTL: a
+/// forwarder handing out TTL 0 (or a near-expired TTL from its own cache)
+/// would otherwise leave nothing to cache.
+pub const MIN_POSITIVE_TTL: Duration = Duration::from_secs(30);
 
 /// Above this many remembered names, finished entries are dropped.
 const MAX_FLIGHTS: usize = 4096;
@@ -104,7 +110,11 @@ impl std::fmt::Debug for CachingResolver {
     }
 }
 
-fn build(config: ResolverConfig, opts: ResolverOpts) -> (TokioAsyncResolver, Vec<SocketAddr>) {
+fn build(config: ResolverConfig, mut opts: ResolverOpts) -> (TokioAsyncResolver, Vec<SocketAddr>) {
+    opts.positive_min_ttl = Some(
+        opts.positive_min_ttl
+            .map_or(MIN_POSITIVE_TTL, |t| t.max(MIN_POSITIVE_TTL)),
+    );
     let nameservers = config
         .name_servers()
         .iter()
@@ -331,9 +341,9 @@ mod tests {
     use tokio::net::{TcpListener, UdpSocket};
 
     /// A UDP name server on loopback answering every A query with 127.0.0.1
-    /// (TTL one hour) and every other type with no records, or nothing at
-    /// all when `silent`. Counts the queries it receives.
-    async fn name_server(silent: bool) -> (u16, Arc<AtomicUsize>) {
+    /// for `ttl` seconds and every other type with no records, or nothing at
+    /// all when `ttl` is `None`. Counts the queries it receives.
+    async fn name_server(ttl: Option<u32>) -> (u16, Arc<AtomicUsize>) {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let port = socket.local_addr().unwrap().port();
         let queries = Arc::new(AtomicUsize::new(0));
@@ -342,9 +352,9 @@ mod tests {
             let mut buf = vec![0u8; 4096];
             while let Ok((len, from)) = socket.recv_from(&mut buf).await {
                 counter.fetch_add(1, Ordering::SeqCst);
-                if silent {
+                let Some(ttl) = ttl else {
                     continue;
-                }
+                };
                 let Ok(request) = Message::from_vec(&buf[..len]) else {
                     continue;
                 };
@@ -360,7 +370,7 @@ mod tests {
                     if query.query_type() == RecordType::A {
                         response.add_answer(Record::from_rdata(
                             query.name().clone(),
-                            3600,
+                            ttl,
                             RData::A(A(Ipv4Addr::LOCALHOST)),
                         ));
                     }
@@ -389,7 +399,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_and_repeated_lookups_cost_one_query() {
-        let (port, queries) = name_server(false).await;
+        let (port, queries) = name_server(Some(3600)).await;
         let resolver = resolver_for(port, Duration::from_secs(2));
 
         let cold: Vec<_> = (0..200)
@@ -411,8 +421,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_zero_ttl_answer_is_still_cached() {
+        let (port, queries) = name_server(Some(0)).await;
+        let resolver = resolver_for(port, Duration::from_secs(2));
+        for _ in 0..100 {
+            resolver.lookup("plc.example.test.").await.unwrap();
+        }
+        assert_eq!(queries.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn a_failure_is_remembered_briefly() {
-        let (port, queries) = name_server(true).await;
+        let (port, queries) = name_server(None).await;
         let resolver = resolver_for(port, Duration::from_millis(200));
 
         let tasks: Vec<_> = (0..100)
@@ -491,7 +511,7 @@ mod tests {
     /// name is looked up once.
     #[tokio::test]
     async fn plc_resolvers_built_per_event_share_one_lookup() {
-        let (dns_port, queries) = name_server(false).await;
+        let (dns_port, queries) = name_server(Some(3600)).await;
         let (plc_port, connections) = plc_directory().await;
         let dns = resolver_for(dns_port, Duration::from_secs(2));
         let plc_url = format!("http://plc.example.test:{plc_port}");
