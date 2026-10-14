@@ -20,8 +20,22 @@ pub struct DidPlcResolver {
 
 impl DidPlcResolver {
     pub fn new(plc_url: String, timeout: Duration, cache: Option<Arc<dyn DidCache>>) -> Self {
+        Self::with_dns(plc_url, timeout, cache, crate::dns::shared())
+    }
+
+    /// Resolves the directory's host name through `dns`. The default,
+    /// [`crate::dns::shared`], is the one cache for the whole process: a
+    /// client's own (reqwest's per-client hickory) starts cold, and every
+    /// `IdResolver` built per event then cost a query per connection.
+    pub fn with_dns(
+        plc_url: String,
+        timeout: Duration,
+        cache: Option<Arc<dyn DidCache>>,
+        dns: Arc<crate::dns::CachingResolver>,
+    ) -> Self {
         let client = reqwest::Client::builder()
             .timeout(timeout)
+            .dns_resolver(Arc::new(crate::dns::Handle(dns)))
             .build()
             .unwrap_or_default();
         Self {

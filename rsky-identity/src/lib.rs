@@ -52,6 +52,7 @@ impl IdResolver {
 
 pub mod common;
 pub mod did;
+pub mod dns;
 pub mod errors;
 pub mod handle;
 pub mod types;
