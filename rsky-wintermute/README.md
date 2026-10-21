@@ -262,6 +262,8 @@ Wintermute indexes all standard bsky record types:
 - `chat.bsky.actor.declaration` - Chat declarations
 - `app.bsky.notification.declaration` - Notification declarations
 - `app.bsky.actor.status` - Actor status
+- `community.lexicon.calendar.event` - Calendar events (needs `community.lexicon.calendar.` in `RECORD_COLLECTION_ALLOWLIST` when the allowlist is set)
+- `community.lexicon.calendar.rsvp` - Calendar RSVPs; one row per actor and event, the latest write wins
 
 All records are also stored in the generic `record` table with full JSON.
 
@@ -390,6 +392,7 @@ Requires a PostgreSQL database with the bsky dataplane schema. Tables include:
 - `notification`, `label`
 - `record`, `sub_state`
 - `verification`
+- `calendar_event`, `calendar_rsvp`
 
 ## Running the database-backed tests
 

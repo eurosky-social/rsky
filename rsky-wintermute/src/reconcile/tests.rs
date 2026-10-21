@@ -474,7 +474,7 @@ async fn ordinary_reconcile_removes_phantoms_and_restores_missing_records() {
         .await
         .unwrap();
     assert_eq!(stored_revs(&pool, did).await.len(), 2);
-    let newer = format!("{}z", &rev[..rev.len() - 1]);
+    let newer = rsky_common::tid::TID::next_str(Some(rev.clone())).unwrap();
     let stale_generation = job(
         &repo.uri("ccc"),
         "bafynew",
@@ -613,7 +613,7 @@ async fn newer_downstream_needs_reset_to_repo() {
     reset_actor(&pool, did).await;
     let repo = TestRepo::create(did, &[("aaa", "one"), ("bbb", "two")]).await;
     let rev = repo.rev();
-    let newer = format!("{}z", &rev[..rev.len() - 1]);
+    let newer = rsky_common::tid::TID::next_str(Some(rev.clone())).unwrap();
     // downstream holds a phantom and a differing value both newer than the
     // repository, and the frontier says a newer revision was published, so
     // the missing record bbb may be a newer deletion
@@ -1119,8 +1119,8 @@ async fn a_commit_acknowledgement_is_retried_until_it_is_durable() {
     // a record write that fails in the same batch withholds the acknowledgement
     client
         .batch_execute(&format!(
-            "DROP TRIGGER IF EXISTS wintermute_test_refuse_record_ack ON record; \
-             CREATE TRIGGER wintermute_test_refuse_record_ack BEFORE INSERT ON record FOR EACH ROW \
+            "DROP TRIGGER IF EXISTS wintermute_test_refuse_batch_record ON record; \
+             CREATE TRIGGER wintermute_test_refuse_batch_record BEFORE INSERT ON record FOR EACH ROW \
              WHEN (NEW.did = '{did}') EXECUTE FUNCTION wintermute_test_refuse();"
         ))
         .await
@@ -1162,7 +1162,7 @@ async fn a_commit_acknowledgement_is_retried_until_it_is_durable() {
         Some("bafyack")
     );
     client
-        .batch_execute("DROP TRIGGER wintermute_test_refuse_record_ack ON record")
+        .batch_execute("DROP TRIGGER wintermute_test_refuse_batch_record ON record")
         .await
         .unwrap();
     reset_actor(&pool, did).await;

@@ -1129,16 +1129,8 @@ impl IngesterManager {
 
         // Identity events arrive before any commit for brand-new accounts,
         // so an update-only write would drop the handle the event carries.
-        // Reset tries on success.
-        let client = pool.get().await?;
-        client
-            .execute(
-                "INSERT INTO actor (did, handle, \"indexedAt\", \"handleResolveTries\") \
-                 VALUES ($1, $2, $3, 0) \
-                 ON CONFLICT (did) DO UPDATE SET handle = EXCLUDED.handle, \
-                 \"indexedAt\" = EXCLUDED.\"indexedAt\", \"handleResolveTries\" = 0",
-                &[&did, &handle, &timestamp],
-            )
+        let mut client = pool.get().await?;
+        crate::actor_handle::upsert_actor_handle(&mut client, did, handle.as_deref(), timestamp)
             .await?;
 
         tracing::info!(

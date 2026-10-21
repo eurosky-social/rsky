@@ -330,6 +330,26 @@ impl Storage {
         })
     }
 
+    /// Fsyncs every queue log so an immediate process exit loses nothing.
+    /// The logs also sync on drop, but the shutdown deadline in `main.rs`
+    /// calls this right before `std::process::exit`, which skips drops.
+    pub fn persist(&self) -> Result<(), WintermuteError> {
+        let logs = self
+            .repo_backfill
+            .logs()
+            .into_iter()
+            .chain([
+                &self.firehose_live,
+                &self.label_live,
+                &self.firehose_backfill_priority,
+            ])
+            .chain(self.firehose_backfill_shards.iter());
+        for log in logs {
+            log.sync()?;
+        }
+        Ok(())
+    }
+
     // ---- firehose_events ---------------------------------------------------
 
     fn event_path(&self, seq: i64) -> PathBuf {
@@ -757,6 +777,15 @@ mod tests {
         let db_path = temp_dir.path().join("test_db");
         let storage = Storage::new(Some(db_path)).unwrap();
         (storage, temp_dir)
+    }
+
+    #[test]
+    fn persist_flushes_without_error() {
+        let (storage, _dir) = setup_test_storage();
+        storage
+            .enqueue_firehose_live(&index_job("at://did:plc:a/app.bsky.feed.post/p"))
+            .unwrap();
+        storage.persist().unwrap();
     }
 
     fn index_job(uri: &str) -> IndexJob {
