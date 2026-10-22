@@ -15,9 +15,21 @@ use rsky_repo::readable_repo::ReadableRepo;
 use rsky_repo::storage::memory_blockstore::MemoryBlockstore;
 use std::future::Future;
 use std::io::Cursor;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
+
+/// The resolver for repositories missing from the PDS cache, built once:
+/// built per repository, each carried its own PLC client, connection pool
+/// and DNS cache. Same settings as before (plc.directory, default timeout).
+static BACKFILL_RESOLVER: LazyLock<IdResolver> = LazyLock::new(|| {
+    IdResolver::new(IdentityResolverOpts {
+        timeout: None,
+        plc_url: None,
+        did_cache: None,
+        backup_nameservers: None,
+    })
+});
 
 pub struct BackfillerManager {
     workers: usize,
@@ -309,14 +321,7 @@ impl BackfillerManager {
         let pds_endpoint = if let Some(cached) = pds_cache.get(did) {
             cached.value().clone()
         } else {
-            let resolver_opts = IdentityResolverOpts {
-                timeout: None,
-                plc_url: None,
-                did_cache: None,
-                backup_nameservers: None,
-            };
-            let resolver = IdResolver::new(resolver_opts);
-            let Ok(Some(doc)) = resolver.did.resolve(did.to_string(), None).await else {
+            let Ok(Some(doc)) = BACKFILL_RESOLVER.did.resolve(did.to_string(), None).await else {
                 metrics::BACKFILLER_REPOS_FAILED_TOTAL.inc();
                 return Err(WintermuteError::Other(format!(
                     "did resolution failed for: {did}"

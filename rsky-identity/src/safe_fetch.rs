@@ -156,22 +156,19 @@ pub trait Lookup: Send + Sync {
     async fn lookup(&self, host: &str) -> Result<Vec<IpAddr>, String>;
 }
 
-/// The system's resolver, through hickory.
+/// The system's resolver, through the process-wide [`crate::dns::shared`]
+/// cache: every client built here shares one cache and one lookup per name
+/// in flight, however many clients there are.
 pub struct SystemLookup {
-    resolver: hickory_resolver::TokioAsyncResolver,
+    resolver: Arc<crate::dns::CachingResolver>,
 }
 
 impl SystemLookup {
     #[must_use]
     pub fn new() -> Self {
-        let resolver = hickory_resolver::TokioAsyncResolver::tokio_from_system_conf()
-            .unwrap_or_else(|_| {
-                hickory_resolver::TokioAsyncResolver::tokio(
-                    hickory_resolver::config::ResolverConfig::default(),
-                    hickory_resolver::config::ResolverOpts::default(),
-                )
-            });
-        Self { resolver }
+        Self {
+            resolver: crate::dns::shared(),
+        }
     }
 }
 
@@ -184,12 +181,7 @@ impl Default for SystemLookup {
 #[async_trait::async_trait]
 impl Lookup for SystemLookup {
     async fn lookup(&self, host: &str) -> Result<Vec<IpAddr>, String> {
-        let answer = self
-            .resolver
-            .lookup_ip(host)
-            .await
-            .map_err(|e| e.to_string())?;
-        Ok(answer.iter().collect())
+        self.resolver.lookup(host).await
     }
 }
 

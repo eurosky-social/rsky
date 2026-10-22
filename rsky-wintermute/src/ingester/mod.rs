@@ -12,13 +12,27 @@ use crate::types::{CommitData, FirehoseEvent, IndexJob, WintermuteError, WriteAc
 use deadpool_postgres::{Config, ManagerConfig, Pool, RecyclingMethod, Runtime};
 use futures::SinkExt;
 use futures::stream::{FuturesUnordered, StreamExt};
-use std::sync::Arc;
 use std::sync::atomic::AtomicI64;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 use tokio::time::interval;
 use tokio_postgres::NoTls;
 use tokio_tungstenite::tungstenite::Message;
+
+/// The identity resolver for firehose identity, account and sync events,
+/// built once. Built per event, each carried its own PLC client, connection
+/// pool and DNS cache, so every event cost a fresh lookup of the PLC host
+/// and a new TLS connection (~40k queries/s for plc.eurosky.network on
+/// juice). Clones share the clients.
+static EVENT_RESOLVER: LazyLock<rsky_identity::IdResolver> = LazyLock::new(|| {
+    rsky_identity::IdResolver::new(rsky_identity::types::IdentityResolverOpts {
+        timeout: Some(std::time::Duration::from_secs(5)),
+        plc_url: std::env::var("PLC_URL").ok(),
+        did_cache: None,
+        backup_nameservers: None,
+    })
+});
 
 #[derive(Debug)]
 enum ConnectionResult {
@@ -1035,8 +1049,6 @@ impl IngesterManager {
         handle_hint: Option<&str>,
     ) -> Result<(), WintermuteError> {
         use crate::config::HANDLE_MAX_TRIES;
-        use rsky_identity::IdResolver;
-        use rsky_identity::types::IdentityResolverOpts;
 
         tracing::debug!("processing identity event for {}", did);
 
@@ -1046,12 +1058,7 @@ impl IngesterManager {
             Some(h.to_lowercase())
         } else {
             // Resolve DID to get current handle from DID document
-            let mut resolver = IdResolver::new(IdentityResolverOpts {
-                timeout: Some(std::time::Duration::from_secs(5)),
-                plc_url: std::env::var("PLC_URL").ok(),
-                did_cache: None,
-                backup_nameservers: None,
-            });
+            let mut resolver = EVENT_RESOLVER.clone();
 
             match resolver.did.resolve(did.to_owned(), None).await {
                 Ok(Some(doc)) => {
@@ -1227,15 +1234,7 @@ impl IngesterManager {
     /// already migrated away from. The relay forwards them unaware of the migration; the
     /// PLC log is the authoritative answer.
     pub async fn pds_says_active(did: &str) -> Option<bool> {
-        use rsky_identity::IdResolver;
-        use rsky_identity::types::IdentityResolverOpts;
-        let resolver = IdResolver::new(IdentityResolverOpts {
-            timeout: Some(std::time::Duration::from_secs(5)),
-            plc_url: std::env::var("PLC_URL").ok(),
-            did_cache: None,
-            backup_nameservers: None,
-        });
-        let Ok(Some(doc)) = resolver.did.resolve(did.to_owned(), None).await else {
+        let Ok(Some(doc)) = EVENT_RESOLVER.did.resolve(did.to_owned(), None).await else {
             return None;
         };
         let pds_endpoint = doc.service.as_ref()?.iter().find_map(|s| {
