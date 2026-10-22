@@ -101,6 +101,40 @@ async fn oauth_session_can_mint_service_auth_tokens() {
     assert_ne!(status, Status::Ok);
 }
 
+/// `com.atproto.server.createAccount` is a privileged method, but that gate
+/// is for app passwords: the reference checks an OAuth session against its
+/// rpc permission alone. An account migration asks the old PDS for exactly
+/// this token, so a session granted it must receive it.
+#[tokio::test]
+async fn oauth_session_can_mint_a_create_account_service_auth_token() {
+    let (_dir, client) = get_oauth_client().await;
+    create_active_account(&client).await;
+    activate_test_account(&client).await;
+    let path = "/xrpc/com.atproto.server.getServiceAuth\
+                ?aud=did:web:pds.invalid&lxm=com.atproto.server.createAccount";
+
+    let key = dpop_key();
+    let access_token = generic_oauth_access_token(&client, &key).await;
+    let (status, body) = dpop_get(&client, &key, &access_token, path).await;
+    assert_eq!(status, Status::Ok, "{body}");
+    assert!(body["token"].as_str().is_some());
+
+    let (access_token, key) = granular_access_token(
+        &client,
+        "atproto rpc:com.atproto.server.createAccount?aud=*",
+    )
+    .await;
+    let (status, body) = dispatch_scoped_get(&client, path, &access_token, &key).await;
+    assert_eq!(status, Status::Ok, "{body}");
+    assert!(body["token"].as_str().is_some());
+
+    // a grant naming another method does not cover it
+    let (access_token, key) =
+        granular_access_token(&client, "atproto rpc:app.bsky.video.getUploadLimits?aud=*").await;
+    let (status, body) = dispatch_scoped_get(&client, path, &access_token, &key).await;
+    assert_ne!(status, Status::Ok, "{body}");
+}
+
 #[tokio::test]
 async fn oauth_well_known_documents() {
     let (_dir, client) = get_oauth_client().await;
@@ -1901,8 +1935,9 @@ async fn accept_request(client: &Client, request_uri: &str, session: &AuthorizeS
 }
 
 /// An iOS browser is sent through a cookie probe before the request is
-/// bound to a device; a browser that never returns the probe cookie sends
-/// the client an error instead of looping.
+/// bound to a device: a self-submitting page first, an error page with one
+/// more try if the cookie did not survive, and an error to the client if
+/// it still does not, instead of looping.
 #[tokio::test]
 async fn oauth_cookie_probe_on_ios() {
     let (_dir, client) = get_oauth_client().await;
@@ -1924,35 +1959,81 @@ async fn oauth_cookie_probe_on_ios() {
     assert_eq!(response.status(), Status::Ok);
     assert_eq!(
         response_cookie(&response, "cookie-test").as_deref(),
-        Some("1")
+        Some("testing")
     );
     // no device is created yet; the only device-id cookie in the answer is
     // the removal of the one at the old path
     assert_eq!(response_cookie(&response, "device-id").as_deref(), Some(""));
+    let csp = response
+        .headers()
+        .get_one("Content-Security-Policy")
+        .unwrap()
+        .to_string();
+    assert!(csp.contains("script-src 'sha256-"), "{csp}");
     let html = response.into_string().await.unwrap();
-    assert!(html.contains("Cookie Error"), "{html}");
+    assert!(!html.contains("Cookie Error"), "{html}");
     assert!(html.contains("name=\"redirect-test\" value=\"1\""));
     assert!(html.contains(">Continue</button>"));
+    assert!(html.contains("<script>document.forms[0].submit()</script>"));
 
-    // the probe cookie came back: the normal page
+    // the probe cookie came back: the normal page, and no probe next time
     let response = client
         .get(format!(
             "{}&redirect-test=1",
             authorize_path(LOOPBACK_CLIENT_ID, &request_uri)
         ))
         .header(ios())
-        .cookie(("cookie-test", "1"))
+        .cookie(("cookie-test", "testing"))
         .dispatch()
         .await;
     assert_eq!(response.status(), Status::Ok);
+    let passed = response.cookies().get("cookie-test").cloned().unwrap();
+    assert_eq!(passed.value(), "succeeded");
+    assert!(passed.max_age().is_some());
+    let device = response_cookie(&response, "device-id").unwrap();
     let html = response.into_string().await.unwrap();
     assert!(html.contains(">Welcome</h1>"), "{html}");
 
-    // it did not: the client learns the flow cannot continue
+    // a browser that passed before, or already has a device, is not probed
+    for cookie in [
+        ("cookie-test", "succeeded".to_string()),
+        ("device-id", device),
+    ] {
+        let (request_uri, _) = run_par(&client, &key).await;
+        let response = client
+            .get(authorize_path(LOOPBACK_CLIENT_ID, &request_uri))
+            .header(ios())
+            .cookie(cookie)
+            .dispatch()
+            .await;
+        assert_eq!(response.status(), Status::Ok);
+        let html = response.into_string().await.unwrap();
+        assert!(html.contains(">Welcome</h1>"), "{html}");
+    }
+
+    // it did not come back: the error page offers one more try
     let (request_uri, _) = run_par(&client, &key).await;
     let response = client
         .get(format!(
             "{}&redirect-test=1",
+            authorize_path(LOOPBACK_CLIENT_ID, &request_uri)
+        ))
+        .header(ios())
+        .dispatch()
+        .await;
+    assert_eq!(response.status(), Status::Ok);
+    assert_eq!(
+        response_cookie(&response, "cookie-test").as_deref(),
+        Some("testing")
+    );
+    let html = response.into_string().await.unwrap();
+    assert!(html.contains("Cookie Error"), "{html}");
+    assert!(html.contains("name=\"redirect-test\" value=\"2\""));
+
+    // still nothing: the client learns the flow cannot continue
+    let response = client
+        .get(format!(
+            "{}&redirect-test=2",
             authorize_path(LOOPBACK_CLIENT_ID, &request_uri)
         ))
         .header(ios())
@@ -1968,7 +2049,7 @@ async fn oauth_cookie_probe_on_ios() {
     // and once the request is gone, the page says so
     let response = client
         .get(format!(
-            "{}&redirect-test=1",
+            "{}&redirect-test=2",
             authorize_path(LOOPBACK_CLIENT_ID, &request_uri)
         ))
         .header(ios())

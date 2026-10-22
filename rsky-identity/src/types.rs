@@ -278,12 +278,24 @@ mod tests {
     #[tokio::test]
     async fn memory_cache_prunes_expired_entries_as_it_grows() {
         let cache = MemoryCache::new(Some(Duration::from_secs(0)), Some(Duration::from_secs(0)));
-        for i in 0..PRUNE_EVERY {
+        for i in 0..PRUNE_EVERY - 1 {
             let did = format!("did:example:{i}");
             cache.cache_did(did.clone(), doc(&did)).await.unwrap();
         }
-        // The PRUNE_EVERY-th insert swept out everything already expired.
-        assert!(cache.cache.read().unwrap().len() < 2);
+        // With a zero TTL an entry only expires once the clock has moved past
+        // its insert, and a fast machine fits many inserts in one microsecond.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        cache
+            .cache_did("did:example:last".to_owned(), doc("did:example:last"))
+            .await
+            .unwrap();
+        // The PRUNE_EVERY-th insert swept out everything already expired: at
+        // most the last entry survives, if the prune ran in its microsecond.
+        let remaining: Vec<String> = cache.cache.read().unwrap().keys().cloned().collect();
+        assert!(
+            remaining.iter().all(|did| did == "did:example:last"),
+            "expired entries survived the prune: {remaining:?}"
+        );
     }
 
     #[tokio::test]
