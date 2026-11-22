@@ -5440,6 +5440,13 @@ impl IndexerManager {
         cid: &str,
         indexed_at: &str,
     ) -> Result<(), WintermuteError> {
+        // An account's labeler service is its `self` record; Bluesky's indexer
+        // ignores the rest (indexing/plugins/labeler.ts). Storing them gave a
+        // few accounts several rows, and the AppView's "is this account a
+        // labeler" lookup then failed every request that showed one (EUR-647).
+        if rkey != "self" {
+            return Ok(());
+        }
         let uri_obj = AtUri::new(format!("at://{did}/app.bsky.labeler.service/{rkey}"), None)
             .map_err(|e| WintermuteError::Other(format!("invalid uri: {e}")))?;
         let uri = uri_obj.to_string();

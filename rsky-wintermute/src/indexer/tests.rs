@@ -511,6 +511,50 @@ mod indexer_tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_labeler_record_only_self() {
+        // Only an account's `self` labeler record is stored, as in Bluesky's
+        // indexer. With several, the AppView's "is this account a labeler"
+        // lookup failed every request that showed the account (EUR-647).
+        let pool = setup_test_pool();
+        let did = "did:plc:testlabelerrecordkeys";
+        cleanup_test_data(&pool, did).await;
+
+        for rkey in ["self", "3lbbbbbbbbbb2"] {
+            let job = crate::types::IndexJob {
+                uri: format!("at://{did}/app.bsky.labeler.service/{rkey}"),
+                cid: format!("bafylabeler{rkey}"),
+                action: WriteAction::Create,
+                record: Some(serde_json::json!({
+                    "$type": "app.bsky.labeler.service",
+                    "policies": {"labelValues": []},
+                    "createdAt": "2024-01-01T00:00:00Z"
+                })),
+                indexed_at: chrono::Utc::now().to_rfc3339(),
+                rev: "test".to_owned(),
+                provenance: None,
+            };
+            let result = IndexerManager::process_job(&pool, &job, false).await;
+            assert!(result.is_ok(), "labeler record {rkey}: {:?}", result.err());
+        }
+
+        let client = pool.get().await.unwrap();
+        let uris: Vec<String> = client
+            .query("SELECT uri FROM labeler WHERE creator = $1", &[&did])
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(
+            uris,
+            vec![format!("at://{did}/app.bsky.labeler.service/self")],
+            "only the self record should be stored"
+        );
+
+        cleanup_test_data(&pool, did).await;
+    }
+
     // =============================================================================
     // LABELS INDEXING TESTS
     // =============================================================================
