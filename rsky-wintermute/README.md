@@ -244,6 +244,29 @@ car_bytes, deletes_refused, error` per account on stdout, tab-separated. A
 summary with the missing and the extra records by collection goes to
 stderr. `--max-car-mb` (default 512) skips larger repositories.
 
+To read from a full-network mirror such as Hubble instead of each account's
+PDS:
+
+- `--repo-host URL` fetches every repository from that host. No DID is
+  resolved then.
+- `--pds URL` lists the accounts of any host that serves
+  `com.atproto.sync.listRepos`, and `--committed-since YYYY-MM-DD` keeps
+  only those whose latest commit is on or after that day. An account with no
+  commit since a gap began has nothing missing from it.
+- `--max-rps N` spaces the requests to those hosts evenly. A 429 or 5xx
+  answer is tried again after its `Retry-After`, or after a doubling pause,
+  up to 5 tries.
+- `--list-only` prints the accounts it would read, one per line, and stops.
+  With `--limit` the listing stops as soon as it has that many.
+
+```bash
+# The accounts with a commit since 20 June, as a file to run in chunks.
+DATABASE_URL=... fill_repo_gaps --pds https://hubble.microcosm.blue \
+  --committed-since 2026-06-20 --max-rps 20 --list-only > accounts.txt
+DATABASE_URL=... fill_repo_gaps --dids-file accounts.txt \
+  --repo-host https://hubble.microcosm.blue --max-rps 20 --delete-extra --dry-run
+```
+
 ### reindex_did
 
 Reconciles one actor's downstream state against its repository under a

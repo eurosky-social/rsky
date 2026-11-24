@@ -24,6 +24,16 @@
 //! more than 100 records) has its deletes refused and is reported, since
 //! that looks more like a broken download than missed deletes.
 //!
+//! `--repo-host` reads every repository from one host instead of each
+//! account's PDS, for example a full-network mirror such as Hubble; no DID
+//! is resolved then. `--pds` lists the accounts of any host that serves
+//! `com.atproto.sync.listRepos`, and `--committed-since` keeps only those
+//! whose latest commit is on or after a date: an account with no commit
+//! since a gap began can have nothing missing from it. `--max-rps` spaces
+//! the requests to those hosts, and a 429 or 5xx answer is tried again
+//! after its `Retry-After` (or a growing pause). `--list-only` prints the
+//! accounts it would read and stops.
+//!
 //! Prints one tab-separated line per account on stdout and a summary to
 //! stderr. Run it with the service's environment (`PLC_URL`), and with
 //! `--dry-run` first.
@@ -69,9 +79,28 @@ struct Args {
     #[arg(long)]
     dids_file: Option<std::path::PathBuf>,
 
-    /// Every active account on this PDS, from its `com.atproto.sync.listRepos`.
+    /// Every active account on this host, from its
+    /// `com.atproto.sync.listRepos`: a PDS, or a mirror such as Hubble.
     #[arg(long)]
     pds: Option<String>,
+
+    /// With `--pds`, only accounts whose latest commit is on or after this
+    /// date (YYYY-MM-DD, UTC). Accounts without a readable revision stay in.
+    #[arg(long)]
+    committed_since: Option<chrono::NaiveDate>,
+
+    /// Read every repository from this host instead of the account's PDS,
+    /// without resolving the DID.
+    #[arg(long)]
+    repo_host: Option<String>,
+
+    /// Requests per second to the hosts read from, evenly spaced (0 = no limit).
+    #[arg(long, default_value_t = 0.0)]
+    max_rps: f64,
+
+    /// Print the accounts that would be read, one per line, and stop.
+    #[arg(long)]
+    list_only: bool,
 
     /// Accounts read at the same time.
     #[arg(long, default_value_t = 4)]
@@ -101,6 +130,122 @@ struct Args {
 
 /// Deletes below this many are never refused as out of proportion.
 const DELETE_CAP_FLOOR: usize = 100;
+
+/// Tries per request, the first included.
+const MAX_ATTEMPTS: u32 = 5;
+
+/// The longest pause before trying a request again.
+const MAX_RETRY_PAUSE: Duration = Duration::from_secs(300);
+
+const USER_AGENT: &str = "rsky-wintermute-fill-repo-gaps/0.2";
+
+/// Spaces requests evenly, at most `per_second`, across every task.
+struct RateLimiter {
+    interval: Duration,
+    next: tokio::sync::Mutex<tokio::time::Instant>,
+}
+
+impl RateLimiter {
+    /// `None` for no limit (`per_second` of 0 or less).
+    fn new(per_second: f64) -> Option<Self> {
+        (per_second > 0.0).then(|| Self {
+            interval: Duration::from_secs_f64(1.0 / per_second),
+            next: tokio::sync::Mutex::new(tokio::time::Instant::now()),
+        })
+    }
+
+    /// Waits for this caller's slot.
+    async fn wait(&self) {
+        let slot = {
+            let mut next = self.next.lock().await;
+            let slot = (*next).max(tokio::time::Instant::now());
+            *next = slot + self.interval;
+            slot
+        };
+        tokio::time::sleep_until(slot).await;
+    }
+}
+
+/// How long to wait before trying again after an answer with `status`, or
+/// `None` when trying again won't help. `Retry-After` in seconds wins over
+/// the doubling pause; both are capped at [`MAX_RETRY_PAUSE`].
+fn retry_pause(
+    status: reqwest::StatusCode,
+    retry_after: Option<&str>,
+    attempt: u32,
+) -> Option<Duration> {
+    use reqwest::StatusCode;
+    let worth_it = status == StatusCode::TOO_MANY_REQUESTS
+        || (status.is_server_error() && status != StatusCode::NOT_IMPLEMENTED);
+    if !worth_it {
+        return None;
+    }
+    let doubling = Duration::from_secs(2u64.saturating_pow(attempt));
+    let pause = retry_after
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .map_or(doubling, Duration::from_secs);
+    Some(pause.min(MAX_RETRY_PAUSE))
+}
+
+/// A GET that waits for its rate-limit slot, and tries again after a 429,
+/// a 5xx or a connection error, up to [`MAX_ATTEMPTS`] in all. Returns the
+/// last answer, whatever its status.
+async fn get_patiently(
+    http: &reqwest::Client,
+    limiter: Option<&RateLimiter>,
+    url: reqwest::Url,
+) -> Result<reqwest::Response> {
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        if let Some(limiter) = limiter {
+            limiter.wait().await;
+        }
+        match http.get(url.clone()).send().await {
+            Ok(resp) => {
+                let retry_after = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok());
+                match retry_pause(resp.status(), retry_after, attempt) {
+                    Some(pause) if attempt < MAX_ATTEMPTS => {
+                        warn!(
+                            "{}: HTTP {}, trying again in {} s",
+                            url.path(),
+                            resp.status(),
+                            pause.as_secs()
+                        );
+                        tokio::time::sleep(pause).await;
+                    }
+                    _ => return Ok(resp),
+                }
+            }
+            Err(e) if attempt < MAX_ATTEMPTS && (e.is_connect() || e.is_timeout()) => {
+                tokio::time::sleep(Duration::from_secs(2u64.saturating_pow(attempt))).await;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+}
+
+/// The TID of the first moment of `date` (UTC). Revisions are TIDs, which
+/// sort as strings, so a revision at or above it was made on `date` or later.
+fn tid_at_start_of(date: chrono::NaiveDate) -> String {
+    let micros = date
+        .and_time(chrono::NaiveTime::MIN)
+        .and_utc()
+        .timestamp_micros();
+    rsky_common::tid::TID::from_time(usize::try_from(micros).unwrap_or(0), 0).0
+}
+
+/// Whether an account whose latest commit is `rev` may have committed on or
+/// after `since` (a TID). A missing or malformed revision keeps the account.
+fn committed_since(rev: Option<&str>, since: &str) -> bool {
+    match rev {
+        Some(rev) if rev.len() == since.len() => rev >= since,
+        _ => true,
+    }
+}
 
 /// What one account needed and got.
 #[derive(Debug, Default)]
@@ -314,7 +459,12 @@ fn collect_dids(flags: &[String], file: Option<&str>) -> Vec<String> {
 
 struct Ctx {
     pool: deadpool_postgres::Pool,
+    /// For hosts named by DID documents: the guarded outbound transport.
     http: reqwest::Client,
+    /// For the hosts given on the command line (`--repo-host`, `--pds`).
+    host_http: reqwest::Client,
+    repo_host: Option<String>,
+    limiter: Option<RateLimiter>,
     resolver: IdResolver,
     max_car_bytes: usize,
     dry_run: bool,
@@ -337,8 +487,13 @@ async fn main() -> Result<()> {
     let http = rsky_wintermute::outbound::client()?
         .builder()
         .timeout(Duration::from_secs(300))
-        .user_agent("rsky-wintermute-fill-repo-gaps/0.1")
+        .user_agent(USER_AGENT)
         .build()?;
+    let host_http = reqwest::Client::builder()
+        .timeout(Duration::from_secs(300))
+        .user_agent(USER_AGENT)
+        .build()?;
+    let limiter = RateLimiter::new(args.max_rps);
 
     let file = match &args.dids_file {
         Some(path) => Some(std::fs::read_to_string(path)?),
@@ -346,8 +501,21 @@ async fn main() -> Result<()> {
     };
     let mut dids = collect_dids(&args.dids, file.as_deref());
     if let Some(pds) = &args.pds {
-        let listed = list_active_repos(&http, pds).await?;
-        info!("{} active repositories on {pds}", listed.len());
+        let since = args.committed_since.map(tid_at_start_of);
+        let listed = list_active_repos(
+            &host_http,
+            limiter.as_ref(),
+            pds,
+            since.as_deref(),
+            args.limit,
+        )
+        .await?;
+        info!(
+            "{} active repositories on {pds}{}",
+            listed.len(),
+            args.committed_since
+                .map_or_else(String::new, |d| format!(" with a commit since {d}"))
+        );
         let mut seen: HashSet<String> = dids.iter().cloned().collect();
         dids.extend(listed.into_iter().filter(|d| seen.insert(d.clone())));
     }
@@ -357,6 +525,12 @@ async fn main() -> Result<()> {
     if dids.is_empty() {
         return Err(eyre!("no accounts given: use --did, --dids-file or --pds"));
     }
+    if args.list_only {
+        for did in &dids {
+            println!("{did}");
+        }
+        return Ok(());
+    }
 
     let ctx = Arc::new(Ctx {
         pool: rsky_wintermute::config::create_pg_pool(
@@ -364,6 +538,9 @@ async fn main() -> Result<()> {
             rsky_wintermute::config::pg_pool_config(args.concurrency * 2 + 2),
         )?,
         http,
+        host_http,
+        repo_host: args.repo_host.clone(),
+        limiter,
         resolver: IdResolver::new(IdentityResolverOpts {
             timeout: Some(Duration::from_secs(10)),
             plc_url: std::env::var("PLC_URL").ok(),
@@ -489,20 +666,30 @@ fn by_count(counts: &HashMap<String, usize>) -> Vec<(&str, usize)> {
 }
 
 async fn fill_one(ctx: &Ctx, did: &str) -> Result<Report> {
-    let doc = ctx
-        .resolver
-        .did
-        .resolve(did.to_owned(), None)
-        .await
-        .map_err(|e| eyre!("DID resolution: {e}"))?
-        .ok_or_else(|| eyre!("DID not found"))?;
-    let pds = pds_endpoint(did, &doc).ok_or_else(|| eyre!("no PDS in the DID document"))?;
-
-    let url = rsky_wintermute::outbound::client()?.checked(&format!(
-        "{}/xrpc/com.atproto.sync.getRepo?did={did}",
-        pds.trim_end_matches('/')
-    ))?;
-    let resp = ctx.http.get(url).send().await?;
+    let resp = if let Some(host) = &ctx.repo_host {
+        let url = reqwest::Url::parse_with_params(
+            &format!(
+                "{}/xrpc/com.atproto.sync.getRepo",
+                host.trim_end_matches('/')
+            ),
+            &[("did", did)],
+        )?;
+        get_patiently(&ctx.host_http, ctx.limiter.as_ref(), url).await?
+    } else {
+        let doc = ctx
+            .resolver
+            .did
+            .resolve(did.to_owned(), None)
+            .await
+            .map_err(|e| eyre!("DID resolution: {e}"))?
+            .ok_or_else(|| eyre!("DID not found"))?;
+        let pds = pds_endpoint(did, &doc).ok_or_else(|| eyre!("no PDS in the DID document"))?;
+        let url = rsky_wintermute::outbound::client()?.checked(&format!(
+            "{}/xrpc/com.atproto.sync.getRepo?did={did}",
+            pds.trim_end_matches('/')
+        ))?;
+        get_patiently(&ctx.http, ctx.limiter.as_ref(), url).await?
+    };
     if !resp.status().is_success() {
         return Err(eyre!("getRepo: HTTP {}", resp.status()));
     }
@@ -713,7 +900,16 @@ async fn fill_one(ctx: &Ctx, did: &str) -> Result<Report> {
     Ok(report)
 }
 
-async fn list_active_repos(http: &reqwest::Client, pds: &str) -> Result<Vec<String>> {
+/// The active accounts `host` lists with `com.atproto.sync.listRepos`, in
+/// its order; with `since` (a TID), only those committed on or after it.
+/// Stops once it has `stop_after` accounts (0 = never).
+async fn list_active_repos(
+    http: &reqwest::Client,
+    limiter: Option<&RateLimiter>,
+    host: &str,
+    since: Option<&str>,
+    stop_after: usize,
+) -> Result<Vec<String>> {
     #[derive(serde::Deserialize)]
     struct Page {
         #[serde(default)]
@@ -725,29 +921,50 @@ async fn list_active_repos(http: &reqwest::Client, pds: &str) -> Result<Vec<Stri
         did: String,
         #[serde(default = "active_default")]
         active: bool,
+        #[serde(default)]
+        rev: Option<String>,
     }
     const fn active_default() -> bool {
         true
     }
 
-    let base = pds.trim_end_matches('/');
-    let mut dids = Vec::new();
+    let endpoint = format!(
+        "{}/xrpc/com.atproto.sync.listRepos",
+        host.trim_end_matches('/')
+    );
+    let (mut dids, mut seen, mut pages) = (Vec::new(), 0usize, 0usize);
     let mut cursor: Option<String> = None;
     loop {
-        let mut url = format!("{base}/xrpc/com.atproto.sync.listRepos?limit=1000");
+        let mut url = reqwest::Url::parse_with_params(&endpoint, &[("limit", "1000")])?;
         if let Some(c) = &cursor {
-            url.push_str("&cursor=");
-            url.push_str(c);
+            url.query_pairs_mut().append_pair("cursor", c);
         }
-        let url = rsky_wintermute::outbound::client()?.checked(&url)?;
-        let resp = http.get(url).send().await?;
+        let resp = get_patiently(http, limiter, url).await?;
         if !resp.status().is_success() {
             return Err(eyre!("listRepos: HTTP {}", resp.status()));
         }
         let page: Page = resp.json().await?;
         let empty = page.repos.is_empty();
-        dids.extend(page.repos.into_iter().filter(|r| r.active).map(|r| r.did));
+        seen += page.repos.len();
+        dids.extend(
+            page.repos
+                .into_iter()
+                .filter(|r| r.active)
+                .filter(|r| since.is_none_or(|s| committed_since(r.rev.as_deref(), s)))
+                .map(|r| r.did),
+        );
         cursor = page.cursor;
+        pages += 1;
+        if pages % 500 == 0 {
+            info!(
+                "listRepos: {pages} pages, {seen} repositories, {} kept",
+                dids.len()
+            );
+        }
+        if stop_after > 0 && dids.len() >= stop_after {
+            dids.truncate(stop_after);
+            break;
+        }
         if empty || cursor.is_none() {
             break;
         }
@@ -900,6 +1117,202 @@ mod tests {
         assert!(!deletes_out_of_proportion(101, 404, 25), "exactly 25%");
         assert!(deletes_out_of_proportion(2265, 1895, 25));
         assert!(!deletes_out_of_proportion(630, 2805, 25));
+    }
+
+    #[test]
+    fn retry_pause_honours_retry_after_and_skips_hopeless_answers() {
+        use reqwest::StatusCode;
+        let pause = |status, retry_after, attempt| retry_pause(status, retry_after, attempt);
+        assert_eq!(
+            pause(StatusCode::TOO_MANY_REQUESTS, Some("7"), 1),
+            Some(Duration::from_secs(7))
+        );
+        assert_eq!(
+            pause(StatusCode::TOO_MANY_REQUESTS, None, 3),
+            Some(Duration::from_secs(8)),
+            "doubling without Retry-After"
+        );
+        assert_eq!(
+            pause(
+                StatusCode::TOO_MANY_REQUESTS,
+                Some("Wed, 21 Oct 2026 07:28:00 GMT"),
+                1
+            ),
+            Some(Duration::from_secs(2)),
+            "a date falls back to the doubling pause"
+        );
+        assert_eq!(
+            pause(StatusCode::SERVICE_UNAVAILABLE, Some("86400"), 1),
+            Some(MAX_RETRY_PAUSE)
+        );
+        assert!(pause(StatusCode::INTERNAL_SERVER_ERROR, None, 1).is_some());
+        assert_eq!(pause(StatusCode::NOT_IMPLEMENTED, None, 1), None);
+        assert_eq!(pause(StatusCode::BAD_REQUEST, None, 1), None);
+        assert_eq!(pause(StatusCode::NOT_FOUND, None, 1), None);
+        assert_eq!(pause(StatusCode::OK, None, 1), None);
+    }
+
+    #[test]
+    fn committed_since_compares_revisions_with_the_day_they_start() {
+        // 3mq7bf4y36n2e is a revision from 2026-07-09 08:59 UTC.
+        let day = |d: &str| tid_at_start_of(d.parse().unwrap());
+        assert!(day("2026-07-09").as_str() < "3mq7bf4y36n2e");
+        assert!(day("2026-07-10").as_str() > "3mq7bf4y36n2e");
+        let since = day("2026-06-20");
+        assert!(committed_since(Some("3mq7bf4y36n2e"), &since));
+        assert!(
+            committed_since(Some(since.as_str()), &since),
+            "the first moment counts"
+        );
+        assert!(
+            !committed_since(Some("3lido2jgaih2k"), &since),
+            "2024 stays out"
+        );
+        assert!(committed_since(None, &since), "no revision stays in");
+        assert!(
+            committed_since(Some("legacy-rev"), &since),
+            "malformed stays in"
+        );
+    }
+
+    #[tokio::test]
+    async fn rate_limiter_spaces_requests_evenly() {
+        assert!(RateLimiter::new(0.0).is_none());
+        let limiter = RateLimiter::new(50.0).unwrap();
+        let start = tokio::time::Instant::now();
+        for _ in 0..5 {
+            limiter.wait().await;
+        }
+        // The first slot is now; four more follow 20 ms apart.
+        assert!(start.elapsed() >= Duration::from_millis(80));
+    }
+
+    #[tokio::test]
+    async fn get_patiently_tries_a_429_again_and_gives_up_after_the_last_try() {
+        let mut server = mockito::Server::new_async().await;
+        let throttled = server
+            .mock("GET", "/xrpc/com.atproto.sync.getRepo")
+            .match_query(mockito::Matcher::Any)
+            .with_status(429)
+            .with_header("retry-after", "0")
+            .expect(usize::try_from(MAX_ATTEMPTS).unwrap())
+            .create_async()
+            .await;
+        let url = reqwest::Url::parse(&format!(
+            "{}/xrpc/com.atproto.sync.getRepo?did=did:plc:a",
+            server.url()
+        ))
+        .unwrap();
+        let resp = get_patiently(&reqwest::Client::new(), None, url)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 429);
+        throttled.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn get_patiently_returns_a_404_at_once() {
+        let mut server = mockito::Server::new_async().await;
+        let missing = server
+            .mock("GET", "/xrpc/com.atproto.sync.getRepo")
+            .match_query(mockito::Matcher::Any)
+            .with_status(404)
+            .expect(1)
+            .create_async()
+            .await;
+        let url = reqwest::Url::parse(&format!(
+            "{}/xrpc/com.atproto.sync.getRepo?did=did:plc:a",
+            server.url()
+        ))
+        .unwrap();
+        let resp = get_patiently(&reqwest::Client::new(), None, url)
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 404);
+        missing.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_active_repos_follows_the_cursor_and_keeps_recent_active_accounts() {
+        use mockito::Matcher;
+        let mut server = mockito::Server::new_async().await;
+        let first = server
+            .mock("GET", "/xrpc/com.atproto.sync.listRepos")
+            .match_query(Matcher::Exact("limit=1000".to_owned()))
+            .with_body(
+                serde_json::json!({
+                    "cursor": "did:plc:c",
+                    "repos": [
+                        {"did": "did:plc:a", "rev": "3mq7bf4y36n2e", "active": true},
+                        {"did": "did:plc:b", "rev": "3lido2jgaih2k", "active": true},
+                        {"did": "did:plc:c", "rev": "3mq7bf4y36n2e", "active": false},
+                    ],
+                })
+                .to_string(),
+            )
+            .create_async()
+            .await;
+        let second = server
+            .mock("GET", "/xrpc/com.atproto.sync.listRepos")
+            .match_query(Matcher::AllOf(vec![
+                Matcher::UrlEncoded("limit".to_owned(), "1000".to_owned()),
+                Matcher::UrlEncoded("cursor".to_owned(), "did:plc:c".to_owned()),
+            ]))
+            .with_body(
+                serde_json::json!({"repos": [{"did": "did:plc:d", "active": true}]}).to_string(),
+            )
+            .create_async()
+            .await;
+
+        let since = tid_at_start_of("2026-06-20".parse().unwrap());
+        let dids = list_active_repos(
+            &reqwest::Client::new(),
+            None,
+            &server.url(),
+            Some(&since),
+            0,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(dids, vec!["did:plc:a", "did:plc:d"]);
+        first.assert_async().await;
+        second.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn list_active_repos_stops_once_it_has_enough() {
+        let mut server = mockito::Server::new_async().await;
+        let first = server
+            .mock("GET", "/xrpc/com.atproto.sync.listRepos")
+            .match_query(mockito::Matcher::Exact("limit=1000".to_owned()))
+            .with_body(
+                serde_json::json!({
+                    "cursor": "did:plc:b",
+                    "repos": [{"did": "did:plc:a"}, {"did": "did:plc:b"}],
+                })
+                .to_string(),
+            )
+            .expect(1)
+            .create_async()
+            .await;
+        let rest = server
+            .mock("GET", "/xrpc/com.atproto.sync.listRepos")
+            .match_query(mockito::Matcher::UrlEncoded(
+                "cursor".to_owned(),
+                "did:plc:b".to_owned(),
+            ))
+            .expect(0)
+            .create_async()
+            .await;
+
+        let dids = list_active_repos(&reqwest::Client::new(), None, &server.url(), None, 1)
+            .await
+            .unwrap();
+
+        assert_eq!(dids, vec!["did:plc:a"]);
+        first.assert_async().await;
+        rest.assert_async().await;
     }
 
     #[test]
