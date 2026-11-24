@@ -263,11 +263,7 @@ async fn resolve_pds(plc_url: &str, did: &str) -> Result<Option<String>> {
         backup_nameservers: None,
     });
     match resolver.did.resolve(did.to_owned(), None).await {
-        Ok(Some(doc)) => Ok(doc.service.as_ref().and_then(|svcs| {
-            svcs.iter()
-                .find(|s| s.id == "#atproto_pds")
-                .map(|s| s.service_endpoint.clone())
-        })),
+        Ok(Some(doc)) => Ok(rsky_wintermute::ingester::pds_endpoint(did, &doc)),
         Ok(None) => Ok(None),
         Err(e) => Err(color_eyre::eyre::eyre!("PLC resolve failed: {e}")),
     }

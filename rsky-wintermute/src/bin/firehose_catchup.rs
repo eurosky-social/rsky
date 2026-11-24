@@ -617,7 +617,7 @@ impl Replay {
                     )
                     .await
                     {
-                        Ok(()) => counters.processed.fetch_add(1, Ordering::Relaxed),
+                        Ok(_) => counters.processed.fetch_add(1, Ordering::Relaxed),
                         Err(e) => {
                             tracing::warn!(
                                 "account event seq={} failed for {}: {e}",

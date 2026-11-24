@@ -37,6 +37,10 @@ path = "src/bin/reindex_did.rs"
 name = "cleanup_stale_deactivated"
 path = "src/bin/cleanup_stale_deactivated.rs"
 
+[[bin]]
+name = "recheck_deactivated"
+path = "src/bin/recheck_deactivated.rs"
+
 [dependencies]
 base64 = "0.22"
 bytes = "1"
