@@ -224,6 +224,29 @@ the frontier's current commit after three attempts, or the downstream
 state holds records newer than the repository (`--reset-to-repo` deletes
 or overwrites them). See Reconciliation under Operations.
 
+### recheck_deactivated
+
+Clears `upstreamStatus = 'deactivated'` for actors whose account is active.
+These are mostly accounts that moved to another PDS. The old PDS
+deactivates the account about a second after the move, before wintermute
+can see the move. The live ingester asks the PDS again two minutes after
+each deactivation; this tool repairs rows left from before that recheck.
+
+It walks `actor` in primary-key pages (`upstreamStatus` has no index). It
+first asks the relay with `com.atproto.sync.getRepoStatus` and asks the
+account's PDS only when the relay reports the account active, so the
+accounts deactivated on Bluesky's PDSes cost no requests there. A row is
+cleared only if it hasn't changed since it was read. Its `accountEventAt`
+stays, so a replay of the old deactivation changes nothing.
+
+```bash
+# Run with the service's environment (PLC_URL, RELAY_HOSTS). Dry run first.
+DATABASE_URL=... RELAY_HOSTS=relay.example PLC_URL=https://plc.example \
+  recheck_deactivated --dry-run [--limit N] [--concurrency 8]
+```
+
+Logs each `cleared` (or `would clear`) DID and a summary of the counts.
+
 ## Queues
 
 Wintermute uses segmented append-only logs (`src/queue_log.rs`) for durable queues:

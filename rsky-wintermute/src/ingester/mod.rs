@@ -52,6 +52,13 @@ const ENQUEUE_RETRY_DELAYS: [Duration; 4] = [
     Duration::from_secs(5),
 ];
 
+/// How long after a deactivation the account's PDS is asked again.
+///
+/// A move to another PDS ends with the old PDS deactivating the account
+/// about a second after the PLC update, before the PLC mirror shows the new
+/// PDS (2–5 s behind plc.directory). Two minutes is well past both.
+pub const ACCOUNT_RECHECK_DELAY: Duration = Duration::from_secs(120);
+
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum ParseResult {
@@ -486,24 +493,14 @@ impl IngesterManager {
                         let active = account.active;
                         let status = account.status.clone();
                         tokio::spawn(async move {
-                            if !active && Self::pds_says_active(&event_did).await == Some(true) {
-                                tracing::info!(
-                                    "skipped account event for {} (active=false, status={:?}): \
-                                     authoritative PDS reports active=true",
-                                    event_did,
-                                    status.as_deref()
-                                );
-                                metrics::INGESTER_ERRORS_TOTAL
-                                    .with_label_values(&["account_skipped_stale_source"])
-                                    .inc();
-                                return;
-                            }
-                            if let Err(e) = Self::process_account_event(
+                            if let Err(e) = Self::handle_account_event(
                                 &pool_clone,
                                 &event_did,
                                 &event_time,
                                 active,
                                 status.as_deref(),
+                                |did| async move { Self::pds_says_active(&did).await },
+                                ACCOUNT_RECHECK_DELAY,
                             )
                             .await
                             {
@@ -1149,14 +1146,119 @@ impl IngesterManager {
         Ok(())
     }
 
-    /// Process an account event by updating the actor's upstream status
+    /// Applies one firehose `#account` event to the actor row.
+    ///
+    /// A deactivation is dropped when the account's PDS (`pds_says_active`)
+    /// reports the account active. That check alone misses accounts moving
+    /// to another PDS (EUR-693): the old PDS deactivates the account about a
+    /// second after the PLC update, while the PLC mirror still names the old
+    /// PDS, and the new PDS's activation can carry an earlier time, so the
+    /// time guard drops it. Both cases ask the PDS again after
+    /// `recheck_delay`, once the move has settled.
+    pub async fn handle_account_event<F, Fut>(
+        pool: &Pool,
+        did: &str,
+        time: &str,
+        active: bool,
+        status: Option<&str>,
+        pds_says_active: F,
+        recheck_delay: Duration,
+    ) -> Result<(), WintermuteError>
+    where
+        F: Fn(String) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = Option<bool>> + Send,
+    {
+        if !active && pds_says_active(did.to_owned()).await == Some(true) {
+            tracing::info!(
+                "skipped account event for {} (active=false, status={:?}): \
+                 authoritative PDS reports active=true",
+                did,
+                status
+            );
+            crate::metrics::INGESTER_ERRORS_TOTAL
+                .with_label_values(&["account_skipped_stale_source"])
+                .inc();
+            return Ok(());
+        }
+        let applied = Self::process_account_event(pool, did, time, active, status).await?;
+        let recheck = if active {
+            !applied
+        } else {
+            applied && status == Some("deactivated")
+        };
+        if !recheck {
+            return Ok(());
+        }
+        tokio::time::sleep(recheck_delay).await;
+        if Self::recheck_deactivated(pool, did, &pds_says_active).await? {
+            tracing::info!(
+                "cleared upstream_status for {}: its PDS reports active=true on recheck",
+                did
+            );
+            crate::metrics::INGESTER_ERRORS_TOTAL
+                .with_label_values(&["account_recheck_cleared"])
+                .inc();
+        }
+        Ok(())
+    }
+
+    /// Asks the account's PDS again about an actor stored as `deactivated`,
+    /// and clears the flag when the PDS reports the account active. Returns
+    /// whether it cleared the flag.
+    ///
+    /// The stored event time stays, so a replay of the stale deactivation
+    /// still changes nothing. The clear lands only if no other account event
+    /// was applied while the PDS was asked. Takedowns and suspensions are
+    /// never cleared here.
+    pub async fn recheck_deactivated<F, Fut>(
+        pool: &Pool,
+        did: &str,
+        pds_says_active: F,
+    ) -> Result<bool, WintermuteError>
+    where
+        F: FnOnce(String) -> Fut + Send,
+        Fut: std::future::Future<Output = Option<bool>> + Send,
+    {
+        // No connection is held while the PDS is asked.
+        let event_at: Option<chrono::DateTime<chrono::Utc>> = {
+            let client = pool.get().await?;
+            let Some(row) = client
+                .query_opt(
+                    "SELECT \"accountEventAt\" FROM actor
+                      WHERE did = $1 AND \"upstreamStatus\" = 'deactivated'",
+                    &[&did],
+                )
+                .await?
+            else {
+                return Ok(false);
+            };
+            row.get(0)
+        };
+        if pds_says_active(did.to_owned()).await != Some(true) {
+            return Ok(false);
+        }
+        let client = pool.get().await?;
+        let cleared = client
+            .execute(
+                "UPDATE actor SET \"upstreamStatus\" = NULL
+                  WHERE did = $1 AND \"upstreamStatus\" = 'deactivated'
+                    AND \"accountEventAt\" IS NOT DISTINCT FROM $2",
+                &[&did, &event_at],
+            )
+            .await?;
+        Ok(cleared > 0)
+    }
+
+    /// Process an account event by updating the actor's upstream status.
+    /// Returns whether the row changed: `false` when the event is not newer
+    /// than the stored status, or the actor is missing.
     pub async fn process_account_event(
         pool: &Pool,
         did: &str,
         time: &str,
         active: bool,
         status: Option<&str>,
-    ) -> Result<(), WintermuteError> {
+    ) -> Result<bool, WintermuteError> {
         tracing::debug!(
             "processing account event for {}: time={}, active={}, status={:?}",
             did,
@@ -1215,7 +1317,7 @@ impl IngesterManager {
             );
         }
 
-        Ok(())
+        Ok(result > 0)
     }
 
     /// Resolves the actor's current PDS via PLC and queries its `getRepoStatus`.
@@ -1229,13 +1331,7 @@ impl IngesterManager {
         let Ok(Some(doc)) = EVENT_RESOLVER.did.resolve(did.to_owned(), None).await else {
             return None;
         };
-        let pds_endpoint = doc.service.as_ref()?.iter().find_map(|s| {
-            if s.id == "#atproto_pds" {
-                Some(s.service_endpoint.clone())
-            } else {
-                None
-            }
-        })?;
+        let pds_endpoint = pds_endpoint(did, &doc)?;
         let url = crate::outbound::client()
             .ok()?
             .checked(&format!(
@@ -1257,6 +1353,18 @@ impl IngesterManager {
         let body = resp.text().await.ok()?;
         parse_active_flag(&body)
     }
+}
+
+/// The PDS endpoint of a DID document: the service with the id `#atproto_pds`.
+///
+/// plc.directory writes the id relative (`#atproto_pds`), our PLC mirror
+/// with the DID in front (`did:plc:…#atproto_pds`); both are the same id.
+#[must_use]
+pub fn pds_endpoint(did: &str, doc: &rsky_identity::types::DidDocument) -> Option<String> {
+    doc.service.as_ref()?.iter().find_map(|s| {
+        let fragment = s.id.strip_prefix(did).unwrap_or(&s.id);
+        (fragment == "#atproto_pds").then(|| s.service_endpoint.clone())
+    })
 }
 
 /// Parses the `active` boolean out of a `com.atproto.sync.getRepoStatus` JSON body.

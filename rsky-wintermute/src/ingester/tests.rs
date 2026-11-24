@@ -1256,6 +1256,263 @@ mod ingester_tests {
             assert!(status.is_none());
             assert!(at.is_none());
         }
+
+        // EUR-693: an account moving to another PDS. The PLC update lands at
+        // 08:20:14.236, the new PDS activates the account, and the old PDS
+        // deactivates it at 08:20:15.096. The new PDS's activation reaches
+        // the relay later than the old PDS's deactivation, but carries the
+        // earlier time.
+        const MOVE_ACTIVATED_AT: &str = "2026-11-21T08:20:14.900Z";
+        const MOVE_OLD_PDS_DEACTIVATED_AT: &str = "2026-11-21T08:20:15.096Z";
+
+        fn at(time: &str) -> chrono::DateTime<chrono::Utc> {
+            time.parse().unwrap()
+        }
+
+        /// A PDS check that answers `answers[n]` on its n-th call and the
+        /// last answer after that.
+        fn pds_answers(
+            answers: &'static [Option<bool>],
+        ) -> impl Fn(String) -> std::future::Ready<Option<bool>> + Send + Sync {
+            let calls = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            move |_did| {
+                let n = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(answers[n.min(answers.len() - 1)])
+            }
+        }
+
+        #[tokio::test]
+        async fn moved_account_ends_active_when_old_pds_deactivation_is_checked_too_early() {
+            let pool = setup_test_pool();
+            let did = "did:plc:wintermute-test-move-early-check";
+            seed_actor(&pool, did).await;
+
+            // Checked at once, the PLC mirror still names the old PDS, which
+            // reports the account deactivated. Two minutes later the mirror
+            // names the new PDS, which reports it active.
+            IngesterManager::handle_account_event(
+                &pool,
+                did,
+                MOVE_OLD_PDS_DEACTIVATED_AT,
+                false,
+                Some("deactivated"),
+                pds_answers(&[Some(false), Some(true)]),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+            IngesterManager::handle_account_event(
+                &pool,
+                did,
+                MOVE_ACTIVATED_AT,
+                true,
+                None,
+                pds_answers(&[Some(true)]),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+
+            let (status, event_at) = read_actor(&pool, did).await;
+            assert!(status.is_none(), "moved account left as {status:?}");
+            // The stale deactivation keeps its time, so replaying it is a no-op.
+            assert_eq!(event_at, Some(at(MOVE_OLD_PDS_DEACTIVATED_AT)));
+        }
+
+        #[tokio::test]
+        async fn moved_account_ends_active_when_its_activation_arrives_stale() {
+            let pool = setup_test_pool();
+            let did = "did:plc:wintermute-test-move-stale-activation";
+            seed_actor(&pool, did).await;
+
+            // Every check during the deactivation still says inactive.
+            IngesterManager::handle_account_event(
+                &pool,
+                did,
+                MOVE_OLD_PDS_DEACTIVATED_AT,
+                false,
+                Some("deactivated"),
+                pds_answers(&[Some(false)]),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                read_actor(&pool, did).await.0.as_deref(),
+                Some("deactivated")
+            );
+
+            // The new PDS's activation is older than the stored deactivation.
+            IngesterManager::handle_account_event(
+                &pool,
+                did,
+                MOVE_ACTIVATED_AT,
+                true,
+                None,
+                pds_answers(&[Some(true)]),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+
+            let (status, _) = read_actor(&pool, did).await;
+            assert!(status.is_none(), "moved account left as {status:?}");
+        }
+
+        #[tokio::test]
+        async fn deactivation_stays_when_the_pds_confirms_it() {
+            let pool = setup_test_pool();
+            let did = "did:plc:wintermute-test-real-deactivation";
+            seed_actor(&pool, did).await;
+
+            IngesterManager::handle_account_event(
+                &pool,
+                did,
+                MOVE_OLD_PDS_DEACTIVATED_AT,
+                false,
+                Some("deactivated"),
+                pds_answers(&[Some(false)]),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+
+            let (status, event_at) = read_actor(&pool, did).await;
+            assert_eq!(status.as_deref(), Some("deactivated"));
+            assert_eq!(event_at, Some(at(MOVE_OLD_PDS_DEACTIVATED_AT)));
+        }
+
+        #[tokio::test]
+        async fn deactivation_stays_when_the_pds_cannot_be_asked() {
+            let pool = setup_test_pool();
+            let did = "did:plc:wintermute-test-pds-unreachable";
+            seed_actor(&pool, did).await;
+
+            IngesterManager::handle_account_event(
+                &pool,
+                did,
+                MOVE_OLD_PDS_DEACTIVATED_AT,
+                false,
+                Some("deactivated"),
+                pds_answers(&[None]),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+            IngesterManager::handle_account_event(
+                &pool,
+                did,
+                MOVE_ACTIVATED_AT,
+                true,
+                None,
+                pds_answers(&[None]),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                read_actor(&pool, did).await.0.as_deref(),
+                Some("deactivated")
+            );
+        }
+
+        #[tokio::test]
+        async fn takedown_is_never_cleared_by_a_recheck() {
+            let pool = setup_test_pool();
+            let did = "did:plc:wintermute-test-takedown-kept";
+            seed_actor(&pool, did).await;
+
+            IngesterManager::handle_account_event(
+                &pool,
+                did,
+                MOVE_OLD_PDS_DEACTIVATED_AT,
+                false,
+                Some("takendown"),
+                pds_answers(&[Some(false), Some(true)]),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+            IngesterManager::handle_account_event(
+                &pool,
+                did,
+                MOVE_ACTIVATED_AT,
+                true,
+                None,
+                pds_answers(&[Some(true)]),
+                std::time::Duration::ZERO,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(read_actor(&pool, did).await.0.as_deref(), Some("takendown"));
+        }
+
+        #[tokio::test]
+        async fn recheck_does_not_clear_a_newer_deactivation() {
+            let pool = setup_test_pool();
+            let did = "did:plc:wintermute-test-recheck-race";
+            seed_actor(&pool, did).await;
+            IngesterManager::process_account_event(
+                &pool,
+                did,
+                MOVE_OLD_PDS_DEACTIVATED_AT,
+                false,
+                Some("deactivated"),
+            )
+            .await
+            .unwrap();
+
+            // While the PDS is being asked, a newer deactivation is applied;
+            // the PDS's answer predates it.
+            let newer = "2026-11-21T08:25:00Z";
+            let race_pool = pool.clone();
+            let cleared = IngesterManager::recheck_deactivated(&pool, did, move |did| {
+                let pool = race_pool.clone();
+                async move {
+                    IngesterManager::process_account_event(
+                        &pool,
+                        &did,
+                        newer,
+                        false,
+                        Some("deactivated"),
+                    )
+                    .await
+                    .unwrap();
+                    Some(true)
+                }
+            })
+            .await
+            .unwrap();
+
+            assert!(!cleared);
+            let (status, event_at) = read_actor(&pool, did).await;
+            assert_eq!(status.as_deref(), Some("deactivated"));
+            assert_eq!(event_at, Some(at(newer)));
+        }
+
+        #[tokio::test]
+        async fn recheck_skips_actors_that_are_not_deactivated() {
+            let pool = setup_test_pool();
+            let did = "did:plc:wintermute-test-recheck-active";
+            seed_actor(&pool, did).await;
+
+            let asked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let asked_in_check = std::sync::Arc::clone(&asked);
+            let cleared = IngesterManager::recheck_deactivated(&pool, did, move |_did| {
+                asked_in_check.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::future::ready(Some(true))
+            })
+            .await
+            .unwrap();
+
+            assert!(!cleared);
+            assert!(
+                !asked.load(std::sync::atomic::Ordering::SeqCst),
+                "asked the PDS about an active actor"
+            );
+        }
     }
 
     mod identity_event_upsert {
@@ -1472,6 +1729,76 @@ mod ingester_tests {
         #[test]
         fn empty_body() {
             assert_eq!(parse_active_flag(""), None);
+        }
+    }
+
+    mod pds_endpoint {
+        use crate::ingester::pds_endpoint;
+
+        const DID: &str = "did:plc:edmegccvl47x6itnfn2hl74g";
+
+        fn doc(service_ids: &[(&str, &str)]) -> rsky_identity::types::DidDocument {
+            let services: Vec<serde_json::Value> = service_ids
+                .iter()
+                .map(|(id, endpoint)| {
+                    serde_json::json!({
+                        "id": id,
+                        "type": "AtprotoPersonalDataServer",
+                        "serviceEndpoint": endpoint,
+                    })
+                })
+                .collect();
+            serde_json::from_value(serde_json::json!({
+                "@context": ["https://www.w3.org/ns/did/v1"],
+                "id": DID,
+                "alsoKnownAs": ["at://example.northsky.social"],
+                "verificationMethod": [],
+                "service": services,
+            }))
+            .unwrap()
+        }
+
+        #[test]
+        fn relative_id_as_plc_directory_writes_it() {
+            let d = doc(&[("#atproto_pds", "https://northsky.social")]);
+            assert_eq!(
+                pds_endpoint(DID, &d).as_deref(),
+                Some("https://northsky.social")
+            );
+        }
+
+        #[test]
+        fn id_with_the_did_as_our_plc_mirror_writes_it() {
+            let id = format!("{DID}#atproto_pds");
+            let d = doc(&[(id.as_str(), "https://northsky.social")]);
+            assert_eq!(
+                pds_endpoint(DID, &d).as_deref(),
+                Some("https://northsky.social")
+            );
+        }
+
+        #[test]
+        fn another_did_is_not_this_accounts_pds() {
+            let d = doc(&[("did:plc:someoneelse#atproto_pds", "https://evil.example")]);
+            assert_eq!(pds_endpoint(DID, &d), None);
+        }
+
+        #[test]
+        fn other_services_are_skipped() {
+            let id = format!("{DID}#atproto_pds");
+            let d = doc(&[
+                ("#bsky_fg", "https://feed.example"),
+                (id.as_str(), "https://northsky.social"),
+            ]);
+            assert_eq!(
+                pds_endpoint(DID, &d).as_deref(),
+                Some("https://northsky.social")
+            );
+        }
+
+        #[test]
+        fn no_services() {
+            assert_eq!(pds_endpoint(DID, &doc(&[])), None);
         }
     }
 }
