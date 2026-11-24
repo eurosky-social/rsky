@@ -933,6 +933,8 @@ async fn an_unreachable_frontier_fails_closed_and_releases_the_fence() {
     reset_actor(&pool, did).await;
 }
 
+// Tests that use it run one at a time: replacing the function while another
+// test creates a trigger on it deadlocks.
 const REFUSE_FN: &str = "CREATE OR REPLACE FUNCTION wintermute_test_refuse() RETURNS trigger \
     LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected write failure'; END $$;";
 
@@ -1008,6 +1010,7 @@ async fn a_fence_held_by_another_workflow_is_never_taken_over() {
 /// A write that fails after the boundary was persisted leaves the actor
 /// fenced with its boundary; only the same workflow finishes the job.
 #[tokio::test]
+#[serial_test::serial(wintermute_test_refuse)]
 async fn a_failed_write_after_the_boundary_keeps_the_fence_for_the_workflow() {
     let pool = pool().await;
     let did = "did:plc:wintermute-failed-write";
@@ -1072,6 +1075,7 @@ async fn a_failed_write_after_the_boundary_keeps_the_fence_for_the_workflow() {
 /// A commit is acknowledged only once its event's writes and the
 /// acknowledgement row are durable; anything less hands the job back.
 #[tokio::test]
+#[serial_test::serial(wintermute_test_refuse)]
 async fn a_commit_acknowledgement_is_retried_until_it_is_durable() {
     let pool = pool().await;
     let did = "did:plc:wintermute-ack";
