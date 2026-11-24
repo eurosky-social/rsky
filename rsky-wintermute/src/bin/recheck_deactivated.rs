@@ -333,6 +333,21 @@ mod tests {
     #[tokio::test]
     async fn walk_past_the_end_is_none() {
         let pool = test_pool();
-        assert!(next_page(&pool, "\u{10FFFF}", 10).await.unwrap().is_none());
+        let client = pool.get().await.unwrap();
+        // The table's own last DID, so the test holds under any collation.
+        client
+            .execute(
+                "INSERT INTO actor (did, handle, \"indexedAt\") VALUES ($1, $2, NOW())
+                 ON CONFLICT DO NOTHING",
+                &[&"did:plc:recheckwalkend", &"recheckwalkend.test"],
+            )
+            .await
+            .unwrap();
+        let last: String = client
+            .query_one("SELECT did FROM actor ORDER BY did DESC LIMIT 1", &[])
+            .await
+            .unwrap()
+            .get(0);
+        assert!(next_page(&pool, &last, 10).await.unwrap().is_none());
     }
 }
