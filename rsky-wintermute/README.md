@@ -206,6 +206,34 @@ Prints `uri<TAB>outcome<TAB>detail` per post on stdout: `repaired` (or
 is non-zero only when an indexing write failed. Repaired posts are stamped
 with their `createdAt` (capped at now) as `indexedAt`.
 
+### fill_repo_gaps
+
+Fills gaps in accounts' indexed history: posts, likes, follows and reposts
+the AppView missed while it was down or behind. For each account it reads
+the whole repository with `com.atproto.sync.getRepo` and compares it with
+`record` by URI and CID. It then indexes only the records that are missing
+or held in an older version, so a complete account costs a download and one
+indexed query, and no writes.
+
+Each written record is stamped with its own `createdAt` (capped at now) as
+`indexedAt`. Its notifications then carry the old time: they are listed in
+the past, not as new. The AppView's push bridge doesn't push them only if it
+has `BSKY_NOTIFICATION_PUSH_MAX_AGE_MINUTES`, so check that before you run
+this. Records `record` holds that the repository no longer has are deletes
+the AppView missed. They are counted as `extra`, not removed.
+
+```bash
+# Run with the service's environment (PLC_URL). Dry run first.
+DATABASE_URL=... PLC_URL=https://plc.example \
+  fill_repo_gaps --pds https://pds.example --dry-run [--limit N] [--concurrency 4]
+DATABASE_URL=... fill_repo_gaps --did did:plc:... [--dids-file dids.txt]
+```
+
+Prints `did, in_repo, missing, changed, extra, written, failed, car_bytes,
+error` per account on stdout, tab-separated. A summary with the missing
+records by collection goes to stderr. `--max-car-mb` (default 512) skips
+larger repositories.
+
 ### reindex_did
 
 Reconciles one actor's downstream state against its repository under a

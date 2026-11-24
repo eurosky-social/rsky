@@ -41,6 +41,10 @@ path = "src/bin/cleanup_stale_deactivated.rs"
 name = "recheck_deactivated"
 path = "src/bin/recheck_deactivated.rs"
 
+[[bin]]
+name = "fill_repo_gaps"
+path = "src/bin/fill_repo_gaps.rs"
+
 [dependencies]
 base64 = "0.22"
 bytes = "1"
