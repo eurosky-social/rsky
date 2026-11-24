@@ -14,7 +14,15 @@
 //! whose push bridge has that check.
 //!
 //! Records the AppView holds but the repository no longer has are deletes it
-//! missed. They are counted (`extra`), not removed.
+//! missed (`extra`). With `--delete-extra` they are removed through the
+//! indexer, exactly as a live delete would remove them (the record, its row
+//! in the typed table, and the counts it was part of). Only records
+//! indexed from the downloaded revision or an older one are removed: a record
+//! written after the download has a newer revision and stays (`kept`), and
+//! the indexer checks the revision again when it deletes. An account whose
+//! deletes would be more than `--max-delete-percent` of its repository (and
+//! more than 100 records) has its deletes refused and is reported, since
+//! that looks more like a broken download than missed deletes.
 //!
 //! Prints one tab-separated line per account on stdout and a summary to
 //! stderr. Run it with the service's environment (`PLC_URL`), and with
@@ -80,7 +88,19 @@ struct Args {
     /// Compare and report, without writing.
     #[arg(long)]
     dry_run: bool,
+
+    /// Also remove the records the repository no longer has.
+    #[arg(long)]
+    delete_extra: bool,
+
+    /// Refuse an account's deletes when they are more than this percentage
+    /// of the records in its repository (and more than 100).
+    #[arg(long, default_value_t = 25)]
+    max_delete_percent: usize,
 }
+
+/// Deletes below this many are never refused as out of proportion.
+const DELETE_CAP_FLOOR: usize = 100;
 
 /// What one account needed and got.
 #[derive(Debug, Default)]
@@ -88,12 +108,21 @@ struct Report {
     in_repo: usize,
     missing: usize,
     changed: usize,
+    /// Held records the repository no longer has, removable.
     extra: usize,
+    /// Held records the repository doesn't have but that are newer than the
+    /// download or carry no revision; never removed.
+    kept: usize,
     written: usize,
+    deleted: usize,
     failed: usize,
     car_bytes: usize,
+    /// The deletes were refused as out of proportion.
+    deletes_refused: bool,
     /// Missing or changed records by collection.
     needed_by_collection: HashMap<String, usize>,
+    /// Removable records by collection.
+    extra_by_collection: HashMap<String, usize>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -112,42 +141,158 @@ struct Needed {
     need: Need,
 }
 
-/// Compares a repository's records (`collection/rkey` → CID) with the ones
-/// held for the account (URI → CID). Returns the records to index and the
-/// number held that the repository no longer has.
+/// A record the AppView holds for the account.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Held {
+    cid: String,
+    /// The repository revision it was indexed from, if one was kept.
+    rev: Option<String>,
+}
+
+/// How a repository and the records held for its account differ.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Plan {
+    /// Records of the repository to index.
+    needed: Vec<Needed>,
+    /// Held records the repository no longer has, indexed from its revision
+    /// or an older one: deletes that were missed. Sorted.
+    extra: Vec<String>,
+    /// Held records the repository doesn't have but that were indexed from a
+    /// newer revision (written after the download) or carry no revision.
+    kept: usize,
+}
+
+/// Compares a repository at revision `rev` (`collection/rkey` → CID) with the
+/// records held for the account (URI → CID and revision).
 fn plan(
     did: &str,
+    rev: &str,
     repo: &[(String, String)],
-    held: &HashMap<String, String>,
+    held: &HashMap<String, Held>,
     allowed: impl Fn(&str) -> bool,
-) -> (Vec<Needed>, usize) {
-    let mut needed = Vec::new();
+) -> Plan {
+    let mut plan = Plan::default();
     let mut in_repo = HashSet::with_capacity(repo.len());
     for (key, cid) in repo {
-        let Some((collection, _rkey)) = key.split_once('/') else {
-            continue;
-        };
-        if !allowed(collection) {
-            continue;
-        }
         let uri = format!("at://{did}/{key}");
+        let indexed = key
+            .split_once('/')
+            .is_some_and(|(collection, _rkey)| allowed(collection));
         let need = match held.get(&uri) {
+            _ if !indexed => None,
             None => Some(Need::Missing),
-            Some(held_cid) if held_cid != cid => Some(Need::Changed),
+            Some(h) if h.cid != *cid => Some(Need::Changed),
             Some(_) => None,
         };
         if let Some(need) = need {
-            needed.push(Needed {
+            plan.needed.push(Needed {
                 uri: uri.clone(),
                 key: key.clone(),
                 cid: cid.clone(),
                 need,
             });
         }
+        // Every record of the repository, also in collections not indexed:
+        // a held one from a collection dropped later is not a delete.
         in_repo.insert(uri);
     }
-    let extra = held.keys().filter(|uri| !in_repo.contains(*uri)).count();
-    (needed, extra)
+    for (uri, h) in held {
+        if in_repo.contains(uri) {
+            continue;
+        }
+        match &h.rev {
+            Some(held_rev) if held_rev.as_str() <= rev => plan.extra.push(uri.clone()),
+            _ => plan.kept += 1,
+        }
+    }
+    plan.extra.sort();
+    plan
+}
+
+/// Whether `deletes` for a repository of `in_repo` records are out of
+/// proportion: more than the floor and more than `max_percent` of it.
+const fn deletes_out_of_proportion(deletes: usize, in_repo: usize, max_percent: usize) -> bool {
+    deletes > DELETE_CAP_FLOOR && deletes.saturating_mul(100) > in_repo.saturating_mul(max_percent)
+}
+
+/// `collection` of an `at://did/collection/rkey` URI.
+fn collection_of(uri: &str) -> &str {
+    uri.trim_start_matches("at://")
+        .split('/')
+        .nth(1)
+        .unwrap_or("")
+}
+
+/// The outcome of [`apply_deletes`].
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Deletes {
+    deleted: usize,
+    /// Still held afterwards: indexed again from a newer revision meanwhile.
+    kept: usize,
+    failed: usize,
+    /// A post or follow was deleted, so the profile counts need recomputing.
+    counted: bool,
+}
+
+/// Removes records through the indexer at revision `rev`: it deletes a
+/// record only if that was indexed from `rev` or an older revision, and
+/// removes it as a live delete would.
+async fn apply_deletes(
+    pool: &deadpool_postgres::Pool,
+    uris: &[String],
+    rev: &str,
+    generation: Option<i64>,
+    indexed_at: &str,
+) -> Deletes {
+    let mut out = Deletes::default();
+    for uri in uris {
+        let job = IndexJob {
+            uri: uri.clone(),
+            cid: String::new(),
+            action: WriteAction::Delete,
+            indexed_at: indexed_at.to_owned(),
+            record: None,
+            rev: rev.to_owned(),
+            provenance: Some(Provenance {
+                generation,
+                source: Source::Direct,
+            }),
+        };
+        let applied = match IndexerManager::process_job(
+            pool,
+            &job,
+            *rsky_wintermute::config::RECORD_SKIP_BOILERPLATE,
+        )
+        .await
+        {
+            // The indexer answers Ok also when the revision kept the record.
+            Ok(()) => still_held(pool, uri).await.map(|held| !held),
+            Err(e) => Err(color_eyre::eyre::Report::from(e)),
+        };
+        match applied {
+            Ok(true) => {
+                out.deleted += 1;
+                out.counted |= matches!(
+                    collection_of(uri),
+                    "app.bsky.feed.post" | "app.bsky.graph.follow"
+                );
+            }
+            Ok(false) => out.kept += 1,
+            Err(e) => {
+                warn!("{uri}: delete: {e}");
+                out.failed += 1;
+            }
+        }
+    }
+    out
+}
+
+async fn still_held(pool: &deadpool_postgres::Pool, uri: &str) -> Result<bool> {
+    let client = pool.get().await?;
+    Ok(client
+        .query_opt("SELECT 1 FROM record WHERE uri = $1", &[&uri])
+        .await?
+        .is_some())
 }
 
 /// DIDs from the flags and the file, in order, without repeats.
@@ -173,6 +318,8 @@ struct Ctx {
     resolver: IdResolver,
     max_car_bytes: usize,
     dry_run: bool,
+    delete_extra: bool,
+    max_delete_percent: usize,
 }
 
 #[tokio::main]
@@ -225,16 +372,26 @@ async fn main() -> Result<()> {
         }),
         max_car_bytes: usize::try_from(args.max_car_mb * 1024 * 1024).unwrap_or(usize::MAX),
         dry_run: args.dry_run,
+        delete_extra: args.delete_extra,
+        max_delete_percent: args.max_delete_percent,
     });
     info!(
-        "{} accounts, {} at a time; {}",
+        "{} accounts, {} at a time; {}{}",
         dids.len(),
         args.concurrency,
-        if args.dry_run { "dry run" } else { "WRITING" }
+        if args.dry_run { "dry run" } else { "WRITING" },
+        if args.delete_extra {
+            ", deleting extra records"
+        } else {
+            ""
+        }
     );
 
-    println!("did\tin_repo\tmissing\tchanged\textra\twritten\tfailed\tcar_bytes\terror");
-    let totals = Arc::new(Mutex::new((Report::default(), 0usize)));
+    println!(
+        "did\tin_repo\tmissing\tchanged\textra\tkept\twritten\tdeleted\tfailed\tcar_bytes\tdeletes_refused\terror"
+    );
+    // The summed report, accounts with errors, accounts with deletes refused.
+    let totals = Arc::new(Mutex::new((Report::default(), 0usize, 0usize)));
     stream::iter(dids)
         .map(|did| {
             let ctx = Arc::clone(&ctx);
@@ -252,31 +409,42 @@ async fn main() -> Result<()> {
                     Err(e) => (Report::default(), e.to_string().replace(['\t', '\n'], " ")),
                 };
                 println!(
-                    "{did}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{error}",
+                    "{did}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{error}",
                     report.in_repo,
                     report.missing,
                     report.changed,
                     report.extra,
+                    report.kept,
                     report.written,
+                    report.deleted,
                     report.failed,
                     report.car_bytes,
+                    u8::from(report.deletes_refused),
                 );
                 let mut totals = totals
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let (sum, errors) = &mut *totals;
+                let (sum, errors, refused) = &mut *totals;
                 if !error.is_empty() {
                     *errors += 1;
+                }
+                if report.deletes_refused {
+                    *refused += 1;
                 }
                 sum.in_repo += report.in_repo;
                 sum.missing += report.missing;
                 sum.changed += report.changed;
                 sum.extra += report.extra;
+                sum.kept += report.kept;
                 sum.written += report.written;
+                sum.deleted += report.deleted;
                 sum.failed += report.failed;
                 sum.car_bytes += report.car_bytes;
                 for (collection, n) in report.needed_by_collection {
                     *sum.needed_by_collection.entry(collection).or_default() += n;
+                }
+                for (collection, n) in report.extra_by_collection {
+                    *sum.extra_by_collection.entry(collection).or_default() += n;
                 }
             }
         })
@@ -285,23 +453,39 @@ async fn main() -> Result<()> {
     let totals = totals
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let (sum, errors) = &*totals;
-    let mut by_collection: Vec<_> = sum.needed_by_collection.iter().collect();
-    by_collection.sort_by(|a, b| b.1.cmp(a.1));
+    let (sum, errors, refused) = &*totals;
     info!(
-        "done: records in repositories {}, missing {}, changed {}, extra {}, written {}, failed {}, \
-         downloaded {} MB, accounts with errors {}",
+        "done: records in repositories {}, missing {}, changed {}, extra {}, kept {}, written {}, \
+         deleted {}, failed {}, downloaded {} MB, accounts with errors {}, accounts with deletes \
+         refused {}",
         sum.in_repo,
         sum.missing,
         sum.changed,
         sum.extra,
+        sum.kept,
         sum.written,
+        sum.deleted,
         sum.failed,
         sum.car_bytes / (1024 * 1024),
-        errors
+        errors,
+        refused
     );
-    info!("missing or changed by collection: {by_collection:?}");
+    info!(
+        "missing or changed by collection: {:?}",
+        by_count(&sum.needed_by_collection)
+    );
+    info!(
+        "extra by collection: {:?}",
+        by_count(&sum.extra_by_collection)
+    );
     Ok(())
+}
+
+/// Collection counts, largest first.
+fn by_count(counts: &HashMap<String, usize>) -> Vec<(&str, usize)> {
+    let mut sorted: Vec<_> = counts.iter().map(|(c, n)| (c.as_str(), *n)).collect();
+    sorted.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(b.0)));
+    sorted
 }
 
 async fn fill_one(ctx: &Ctx, did: &str) -> Result<Report> {
@@ -367,21 +551,34 @@ async fn fill_one(ctx: &Ctx, did: &str) -> Result<Report> {
         .map_err(|e| eyre!("listing records: {e}"))?;
     let rev = repo.commit.rev.clone();
 
-    let held: HashMap<String, String> = {
+    let held: HashMap<String, Held> = {
         let client = ctx.pool.get().await?;
         client
-            .query("SELECT uri, cid FROM record WHERE did = $1", &[&did])
+            .query("SELECT uri, cid, rev FROM record WHERE did = $1", &[&did])
             .await?
             .into_iter()
-            .map(|row| (row.get(0), row.get(1)))
+            .map(|row| {
+                (
+                    row.get(0),
+                    Held {
+                        cid: row.get(1),
+                        rev: row.get(2),
+                    },
+                )
+            })
             .collect()
     };
     let repo_records: Vec<(String, String)> = leaves
         .iter()
         .map(|leaf| (leaf.key.clone(), leaf.value.to_string()))
         .collect();
-    let (needed, extra) = plan(
+    let Plan {
+        needed,
+        extra,
+        kept,
+    } = plan(
         did,
+        &rev,
         &repo_records,
         &held,
         rsky_wintermute::config::ingest_collection_allowed,
@@ -389,8 +586,11 @@ async fn fill_one(ctx: &Ctx, did: &str) -> Result<Report> {
 
     let mut report = Report {
         in_repo: repo_records.len(),
-        extra,
+        extra: extra.len(),
+        kept,
         car_bytes: car.len(),
+        deletes_refused: ctx.delete_extra
+            && deletes_out_of_proportion(extra.len(), repo_records.len(), ctx.max_delete_percent),
         ..Report::default()
     };
     for n in &needed {
@@ -404,7 +604,18 @@ async fn fill_one(ctx: &Ctx, did: &str) -> Result<Report> {
             .entry(collection.to_owned())
             .or_default() += 1;
     }
-    if ctx.dry_run || needed.is_empty() {
+    for uri in &extra {
+        *report
+            .extra_by_collection
+            .entry(collection_of(uri).to_owned())
+            .or_default() += 1;
+    }
+    let deletes: &[String] = if ctx.delete_extra && !report.deletes_refused {
+        &extra
+    } else {
+        &[]
+    };
+    if ctx.dry_run || (needed.is_empty() && deletes.is_empty()) {
         return Ok(report);
     }
 
@@ -467,8 +678,20 @@ async fn fill_one(ctx: &Ctx, did: &str) -> Result<Report> {
         }
     }
 
+    let deleted = apply_deletes(
+        &ctx.pool,
+        deletes,
+        &rev,
+        generation,
+        &now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+    )
+    .await;
+    report.deleted = deleted.deleted;
+    report.kept += deleted.kept;
+    report.failed += deleted.failed;
+
     // The profile's post and follow counts, as direct_index recomputes them.
-    if wrote_counted {
+    if wrote_counted || deleted.counted {
         let client = ctx.pool.get().await?;
         client
             .execute(
@@ -537,11 +760,30 @@ mod tests {
     use super::*;
 
     const DID: &str = "did:plc:fillgapstest";
+    /// The revision of the downloaded repository in the plan tests.
+    const REV: &str = "3mmmmmmmmmmm2";
 
-    fn held(entries: &[(&str, &str)]) -> HashMap<String, String> {
+    fn held(entries: &[(&str, &str)]) -> HashMap<String, Held> {
+        held_at(
+            &entries
+                .iter()
+                .map(|(k, c)| (*k, *c, Some(REV)))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn held_at(entries: &[(&str, &str, Option<&str>)]) -> HashMap<String, Held> {
         entries
             .iter()
-            .map(|(k, c)| (format!("at://{DID}/{k}"), (*c).to_owned()))
+            .map(|(k, c, rev)| {
+                (
+                    format!("at://{DID}/{k}"),
+                    Held {
+                        cid: (*c).to_owned(),
+                        rev: rev.map(str::to_owned),
+                    },
+                )
+            })
             .collect()
     }
 
@@ -567,10 +809,10 @@ mod tests {
             ("app.bsky.graph.follow/d", "cid-d"),
         ]);
 
-        let (needed, extra) = plan(DID, &repo, &held, |_| true);
+        let plan = plan(DID, REV, &repo, &held, |_| true);
 
         assert_eq!(
-            needed,
+            plan.needed,
             vec![
                 Needed {
                     uri: format!("at://{DID}/app.bsky.feed.post/b"),
@@ -586,7 +828,12 @@ mod tests {
                 },
             ]
         );
-        assert_eq!(extra, 1, "the deleted post is counted, not written");
+        assert_eq!(
+            plan.extra,
+            vec![format!("at://{DID}/app.bsky.feed.post/gone")],
+            "the deleted post is a missed delete, not written"
+        );
+        assert_eq!(plan.kept, 0);
     }
 
     #[test]
@@ -595,10 +842,45 @@ mod tests {
             ("app.bsky.feed.post/a", "cid-a"),
             ("chat.bsky.actor.declaration/self", "cid-x"),
         ]);
-        let (needed, extra) = plan(DID, &repo, &HashMap::new(), |c| c == "app.bsky.feed.post");
-        assert_eq!(needed.len(), 1);
-        assert_eq!(needed[0].key, "app.bsky.feed.post/a");
-        assert_eq!(extra, 0);
+        let plan = plan(DID, REV, &repo, &HashMap::new(), |c| {
+            c == "app.bsky.feed.post"
+        });
+        assert_eq!(plan.needed.len(), 1);
+        assert_eq!(plan.needed[0].key, "app.bsky.feed.post/a");
+        assert!(plan.extra.is_empty());
+    }
+
+    #[test]
+    fn plan_never_deletes_a_record_the_repository_still_has() {
+        // Held from when its collection was indexed; the repository still
+        // has it, so it is no delete even though it is no longer indexed.
+        let entries = [
+            ("app.bsky.feed.post/a", "cid-a"),
+            ("chat.bsky.actor.declaration/self", "cid-x"),
+        ];
+        let plan = plan(DID, REV, &repo(&entries), &held(&entries), |c| {
+            c == "app.bsky.feed.post"
+        });
+        assert_eq!(plan, Plan::default());
+    }
+
+    #[test]
+    fn plan_deletes_only_records_indexed_up_to_the_downloaded_revision() {
+        let held = held_at(&[
+            ("app.bsky.feed.like/older", "c1", Some("3maaaaaaaaaa2")),
+            ("app.bsky.feed.like/same", "c2", Some(REV)),
+            ("app.bsky.feed.like/newer", "c3", Some("3mzzzzzzzzzz2")),
+            ("app.bsky.feed.like/unversioned", "c4", None),
+        ]);
+        let plan = plan(DID, REV, &[], &held, |_| true);
+        assert_eq!(
+            plan.extra,
+            vec![
+                format!("at://{DID}/app.bsky.feed.like/older"),
+                format!("at://{DID}/app.bsky.feed.like/same"),
+            ]
+        );
+        assert_eq!(plan.kept, 2, "written after the download, or no revision");
     }
 
     #[test]
@@ -607,9 +889,111 @@ mod tests {
             ("app.bsky.feed.post/a", "cid-a"),
             ("app.bsky.feed.like/b", "cid-b"),
         ];
-        let (needed, extra) = plan(DID, &repo(&entries), &held(&entries), |_| true);
-        assert!(needed.is_empty());
-        assert_eq!(extra, 0);
+        let plan = plan(DID, REV, &repo(&entries), &held(&entries), |_| true);
+        assert_eq!(plan, Plan::default());
+    }
+
+    #[test]
+    fn deletes_out_of_proportion_need_both_the_floor_and_the_share() {
+        assert!(!deletes_out_of_proportion(100, 10, 25), "at the floor");
+        assert!(deletes_out_of_proportion(101, 400, 25));
+        assert!(!deletes_out_of_proportion(101, 404, 25), "exactly 25%");
+        assert!(deletes_out_of_proportion(2265, 1895, 25));
+        assert!(!deletes_out_of_proportion(630, 2805, 25));
+    }
+
+    #[test]
+    fn collection_of_a_uri() {
+        assert_eq!(
+            collection_of("at://did:plc:a/app.bsky.feed.like/3k"),
+            "app.bsky.feed.like"
+        );
+        assert_eq!(collection_of("at://did:plc:a"), "");
+    }
+
+    fn test_pool() -> deadpool_postgres::Pool {
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:postgres@localhost:5432/bsky_test".to_owned()
+        });
+        rsky_wintermute::config::create_pg_pool(&url, rsky_wintermute::config::pg_pool_config(4))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn apply_deletes_removes_only_records_up_to_the_revision() {
+        let did = "did:plc:fillgapsdeletes";
+        let pool = test_pool();
+        let client = pool.get().await.unwrap();
+        for sql in [
+            "DELETE FROM \"like\" WHERE creator = $1",
+            "DELETE FROM notification WHERE author = $1",
+            "DELETE FROM record WHERE did = $1",
+        ] {
+            client.execute(sql, &[&did]).await.unwrap();
+        }
+
+        let older = format!("at://{did}/app.bsky.feed.like/older");
+        let newer = format!("at://{did}/app.bsky.feed.like/newer");
+        // Each like its own subject: the like table keeps one per subject.
+        for (uri, rev, post) in [
+            (&older, "3maaaaaaaaaa2", "p1"),
+            (&newer, "3mzzzzzzzzzz2", "p2"),
+        ] {
+            let job = IndexJob {
+                uri: uri.clone(),
+                cid: format!("bafy{rev}"),
+                action: WriteAction::Create,
+                record: Some(serde_json::json!({
+                    "$type": "app.bsky.feed.like",
+                    "subject": {
+                        "uri": format!("at://did:plc:fillgapsauthor/app.bsky.feed.post/{post}"),
+                        "cid": "bafypost",
+                    },
+                    "createdAt": "2026-07-01T00:00:00.000Z",
+                })),
+                indexed_at: "2026-07-01T00:00:00.000Z".to_owned(),
+                rev: rev.to_owned(),
+                provenance: None,
+            };
+            IndexerManager::process_job(&pool, &job, false)
+                .await
+                .unwrap();
+        }
+
+        let out = apply_deletes(
+            &pool,
+            &[older.clone(), newer.clone()],
+            "3mmmmmmmmmmm2",
+            None,
+            "2026-11-24T00:00:00.000Z",
+        )
+        .await;
+
+        assert_eq!(
+            out,
+            Deletes {
+                deleted: 1,
+                kept: 1,
+                failed: 0,
+                counted: false,
+            }
+        );
+        let held: Vec<String> = client
+            .query("SELECT uri FROM record WHERE did = $1", &[&did])
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(held, vec![newer.clone()]);
+        let likes: Vec<String> = client
+            .query("SELECT uri FROM \"like\" WHERE creator = $1", &[&did])
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(likes, vec![newer]);
     }
 
     #[test]

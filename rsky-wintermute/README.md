@@ -219,20 +219,30 @@ Each written record is stamped with its own `createdAt` (capped at now) as
 `indexedAt`. Its notifications then carry the old time: they are listed in
 the past, not as new. The AppView's push bridge doesn't push them only if it
 has `BSKY_NOTIFICATION_PUSH_MAX_AGE_MINUTES`, so check that before you run
-this. Records `record` holds that the repository no longer has are deletes
-the AppView missed. They are counted as `extra`, not removed.
+this.
+
+Records `record` holds that the repository no longer has are deletes the
+AppView missed (`extra`). With `--delete-extra` they are removed through the
+indexer, as a live delete would remove them. Only records indexed from the
+downloaded revision or an older one count: a record written after the
+download, or one without a revision, stays (`kept`), and the indexer checks
+the revision again when it deletes. When an account's deletes are more than
+100 and more than `--max-delete-percent` (default 25) of its repository,
+they are refused (`deletes_refused` = 1): that looks more like a broken
+download than missed deletes. Review those accounts and run them again with
+a higher limit if the deletes are real.
 
 ```bash
 # Run with the service's environment (PLC_URL). Dry run first.
 DATABASE_URL=... PLC_URL=https://plc.example \
-  fill_repo_gaps --pds https://pds.example --dry-run [--limit N] [--concurrency 4]
-DATABASE_URL=... fill_repo_gaps --did did:plc:... [--dids-file dids.txt]
+  fill_repo_gaps --pds https://pds.example --dry-run [--delete-extra] [--limit N] [--concurrency 4]
+DATABASE_URL=... fill_repo_gaps --did did:plc:... [--dids-file dids.txt] [--delete-extra]
 ```
 
-Prints `did, in_repo, missing, changed, extra, written, failed, car_bytes,
-error` per account on stdout, tab-separated. A summary with the missing
-records by collection goes to stderr. `--max-car-mb` (default 512) skips
-larger repositories.
+Prints `did, in_repo, missing, changed, extra, kept, written, deleted, failed,
+car_bytes, deletes_refused, error` per account on stdout, tab-separated. A
+summary with the missing and the extra records by collection goes to
+stderr. `--max-car-mb` (default 512) skips larger repositories.
 
 ### reindex_did
 
