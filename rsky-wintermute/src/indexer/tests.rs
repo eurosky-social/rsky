@@ -3348,6 +3348,162 @@ mod indexer_tests {
         }
     }
 
+    /// One like job of the equivalence test: `create` or not, at `rev`.
+    fn like_job(liker: &str, post: &str, create: bool, rev: &str) -> crate::types::IndexJob {
+        crate::types::IndexJob {
+            uri: format!("at://{liker}/app.bsky.feed.like/eqlike"),
+            cid: if create {
+                "bafyreihhl5mpvjkrhnnagen2fomozzhnhhdq2jr6cego2nzbvmwewv5rd4".to_owned()
+            } else {
+                String::new()
+            },
+            action: if create {
+                crate::types::WriteAction::Create
+            } else {
+                crate::types::WriteAction::Delete
+            },
+            record: create.then(|| {
+                serde_json::json!({
+                    "$type": "app.bsky.feed.like",
+                    "subject": {"uri": post, "cid": "bafyreihhl5mpvjkrhnnagen2fomozzhnhhdq2jr6cego2nzbvmwewv5rd4"},
+                    "createdAt": "2026-08-04T00:00:00.000Z"
+                })
+            }),
+            indexed_at: "2026-08-04T00:00:00.000Z".to_owned(),
+            rev: rev.to_owned(),
+            provenance: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn skip_boilerplate_changes_only_the_record_rows() {
+        // (name, jobs as (create?, rev), whether the like exists at the end)
+        type Sequence<'a> = (&'a str, &'a [(bool, &'a str)], bool);
+        let sequences: [Sequence<'_>; 5] = [
+            ("create-replay", &[(true, "3a"), (true, "3a")], true),
+            ("create-delete", &[(true, "3a"), (false, "3b")], false),
+            (
+                "delete-replay",
+                &[(true, "3a"), (false, "3b"), (false, "3b")],
+                false,
+            ),
+            // A delete leaves no trace, with the switch on or off: an old
+            // create arriving after it brings the like back either way.
+            (
+                "old-create-after-delete",
+                &[(true, "3a"), (false, "3b"), (true, "3a")],
+                true,
+            ),
+            ("delete-before-create", &[(false, "3b"), (true, "3a")], true),
+        ];
+        let pool = setup_test_pool();
+        let author = "did:plc:wintermute-test-eq-author";
+        for (name, jobs, exists) in sequences {
+            for path in ["single", "batches", "one-batch"] {
+                let mut outcomes = Vec::new();
+                for skip in [false, true] {
+                    let liker = format!("did:plc:wintermute-test-eq-{name}-{path}-{skip}");
+                    let post = format!("at://{author}/app.bsky.feed.post/{name}-{path}-{skip}");
+                    cleanup_test_data(&pool, &liker).await;
+                    let client = pool.get().await.unwrap();
+                    client
+                        .execute(
+                            "INSERT INTO actor (did, \"indexedAt\") VALUES ($1, NOW()) \
+                             ON CONFLICT (did) DO NOTHING",
+                            &[&liker],
+                        )
+                        .await
+                        .unwrap();
+                    client
+                        .execute("DELETE FROM post_agg WHERE uri = $1", &[&post])
+                        .await
+                        .unwrap();
+                    drop(client);
+                    let batch: Vec<(Vec<u8>, crate::types::IndexJob)> = jobs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, (create, rev))| {
+                            (
+                                format!("eq{i}").into_bytes(),
+                                like_job(&liker, &post, *create, rev),
+                            )
+                        })
+                        .collect();
+                    match path {
+                        "single" => {
+                            for (_, job) in &batch {
+                                IndexerManager::process_job(&pool, job, skip).await.unwrap();
+                            }
+                        }
+                        "batches" => {
+                            for one in &batch {
+                                let (results, failed) = IndexerManager::process_jobs_batch(
+                                    &pool,
+                                    std::slice::from_ref(one),
+                                    false,
+                                    skip,
+                                )
+                                .await;
+                                assert!(!failed && results.iter().all(|(_, r)| r.is_ok()));
+                            }
+                        }
+                        _ => {
+                            let (results, failed) =
+                                IndexerManager::process_jobs_batch(&pool, &batch, false, skip)
+                                    .await;
+                            assert!(!failed && results.iter().all(|(_, r)| r.is_ok()));
+                        }
+                    }
+                    let client = pool.get().await.unwrap();
+                    let like_rows: i64 = client
+                        .query_one(
+                            "SELECT count(*) FROM \"like\" WHERE creator = $1",
+                            &[&liker],
+                        )
+                        .await
+                        .unwrap()
+                        .get(0);
+                    let like_count: i64 = client
+                        .query_one(
+                            "SELECT COALESCE((SELECT \"likeCount\" FROM post_agg WHERE uri = $1), 0)",
+                            &[&post],
+                        )
+                        .await
+                        .unwrap()
+                        .get(0);
+                    let notifications: i64 = client
+                        .query_one(
+                            "SELECT count(*) FROM notification WHERE author = $1",
+                            &[&liker],
+                        )
+                        .await
+                        .unwrap()
+                        .get(0);
+                    let record_rows: i64 = client
+                        .query_one("SELECT count(*) FROM record WHERE did = $1", &[&liker])
+                        .await
+                        .unwrap()
+                        .get(0);
+                    drop(client);
+                    if skip {
+                        assert_eq!(
+                            record_rows, 0,
+                            "{name} {path}: no record row with the switch on"
+                        );
+                    }
+                    outcomes.push((like_rows, like_count, notifications));
+                    cleanup_test_data(&pool, &liker).await;
+                }
+                assert_eq!(
+                    outcomes[0], outcomes[1],
+                    "{name} {path}: (likes, likeCount, notifications) off vs on"
+                );
+                assert_eq!(outcomes[0].0, i64::from(exists), "{name} {path}");
+                assert_eq!(outcomes[0].1, i64::from(exists), "{name} {path}: likeCount");
+            }
+        }
+    }
+
     // The stale non-NULL sweep must get a share of every batch even when the
     // NULL-handle backlog alone exceeds the batch (the production shape: tens
     // of millions of unresolvable NULL rows), so imported-but-unverified

@@ -111,6 +111,7 @@ RUST_LOG=info \
 | `HANDLE_RESOLUTION_CONCURRENCY` | `50` | Concurrent handle resolutions within a batch |
 | `HANDLE_STALE_VALID_SHARE` | `50` | Percent of each handle-resolution batch reserved for re-verifying stale non-NULL handles (0-100) |
 | `FETCH_ALLOW_PRIVATE` | (unset) | Let repository and status fetches reach private or plain-http hosts (local development only); otherwise only public https hosts are reachable |
+| `RECORD_SKIP_BOILERPLATE` | `false` | Write likes, reposts, follows and blocks to their typed tables only, not to `record`. The appview must rebuild those records from the typed tables (`getLikeRecords` and the others synthesized) and keep their takedowns there. `fill_repo_gaps`, `reindex_did` and `car_loader` read both, so they work with either setting |
 | `RECONCILE_PDS_URL` | (none) | The PDS `reindex_did` reads frontiers and exports from, as a fixed address |
 | `RECONCILE_PDS_ADMIN_PASSWORD` | (none) | Admin password for the frontier read on that PDS |
 
@@ -211,9 +212,17 @@ with their `createdAt` (capped at now) as `indexedAt`.
 Fills gaps in accounts' indexed history: posts, likes, follows and reposts
 the AppView missed while it was down or behind. For each account it reads
 the whole repository with `com.atproto.sync.getRepo` and compares it with
-`record` by URI and CID. It then indexes only the records that are missing
-or held in an older version, so a complete account costs a download and one
-indexed query, and no writes.
+what the AppView holds, by URI and CID: `record`, plus the typed tables of
+likes, reposts, follows and blocks (with `RECORD_SKIP_BOILERPLATE` they are
+only there). It then indexes only the records that are missing or held in an
+older version, so a complete account costs a download and a few indexed
+queries, and no writes.
+
+The typed tables keep one like (repost, follow, block) per subject. A second
+one of the same subject is a `duplicate`: counted, not written. A like with a
+`record` row but none in its table counts as missing, so a run puts it back.
+Deletes run before writes: when an unlike and a like again of the same post
+were both missed, the old like goes first and the new one then fits.
 
 Each written record is stamped with its own `createdAt` (capped at now) as
 `indexedAt`. Its notifications then carry the old time: they are listed in
@@ -226,8 +235,11 @@ AppView missed (`extra`). With `--delete-extra` they are removed through the
 indexer, as a live delete would remove them. Only records indexed from the
 downloaded revision or an older one count: a record written after the
 download, or one without a revision, stays (`kept`), and the indexer checks
-the revision again when it deletes. When an account's deletes are more than
-100 and more than `--max-delete-percent` (default 25) of its repository,
+the revision again when it deletes. A record held only in its typed table has
+no revision: it counts only if it was indexed more than a minute before the
+download started. Don't run two fills over the same account at once. When an
+account's deletes are more than 100 and more than `--max-delete-percent`
+(default 25) of its repository,
 they are refused (`deletes_refused` = 1): that looks more like a broken
 download than missed deletes. Review those accounts and run them again with
 a higher limit if the deletes are real.
@@ -239,8 +251,9 @@ DATABASE_URL=... PLC_URL=https://plc.example \
 DATABASE_URL=... fill_repo_gaps --did did:plc:... [--dids-file dids.txt] [--delete-extra]
 ```
 
-Prints `did, in_repo, missing, changed, extra, kept, written, deleted, failed,
-car_bytes, deletes_refused, error` per account on stdout, tab-separated. A
+Prints `did, in_repo, missing, changed, extra, kept, duplicate, written,
+deleted, failed, car_bytes, deletes_refused, error` per account on stdout,
+tab-separated. A
 summary with the missing and the extra records by collection goes to
 stderr. `--max-car-mb` (default 512) skips larger repositories.
 

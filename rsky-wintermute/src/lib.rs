@@ -40,6 +40,7 @@
 pub mod actor_handle;
 pub mod backfiller;
 pub mod config;
+pub mod held;
 pub mod indexer;
 pub mod ingester;
 pub mod metrics;

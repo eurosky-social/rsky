@@ -1,10 +1,14 @@
 //! Fills the gaps in accounts' indexed history (EUR-654).
 //!
 //! For each account it reads the whole repository from the account's PDS,
-//! compares it with the records the AppView already holds (`record`, by URI
-//! and CID), and indexes only the records that are missing or held in an
-//! older version. Records already present are not written again, so a fill
-//! costs writes only for the gaps.
+//! compares it with the records the AppView already holds (by URI and CID,
+//! from `record` and, for likes, reposts, follows and blocks written with
+//! `RECORD_SKIP_BOILERPLATE`, their typed tables), and indexes only the
+//! records that are missing or held in an older version. Records already
+//! present are not written again, so a fill costs writes only for the gaps.
+//! A like, repost, follow or block of a subject the account already has one
+//! of is a `duplicate`: the typed tables keep one per subject, so it is
+//! counted and not written.
 //!
 //! Each written record is stamped with its own `createdAt` (capped at now) as
 //! `indexedAt`. Its posts, likes and follows then sort where they were made,
@@ -19,7 +23,12 @@
 //! in the typed table, and the counts it was part of). Only records
 //! indexed from the downloaded revision or an older one are removed: a record
 //! written after the download has a newer revision and stays (`kept`), and
-//! the indexer checks the revision again when it deletes. An account whose
+//! the indexer checks the revision again when it deletes. A record held only
+//! in its typed table has no revision; it is removed only if it was indexed
+//! more than a minute before the download started, so one created after the
+//! download stays. Don't run two fills over the same account at once: a
+//! record the other one writes from a newer download carries its `createdAt`
+//! as the time it was indexed. An account whose
 //! deletes would be more than `--max-delete-percent` of its repository (and
 //! more than 100 records) has its deletes refused and is reported, since
 //! that looks more like a broken download than missed deletes.
@@ -55,6 +64,7 @@ use rsky_repo::parse::get_and_parse_record;
 use rsky_repo::readable_repo::ReadableRepo;
 use rsky_repo::storage::memory_blockstore::MemoryBlockstore;
 use rsky_wintermute::backfiller::convert_record_to_ipld;
+use rsky_wintermute::held::{self, Held, HeldIn, Holdings, collection_of};
 use rsky_wintermute::indexer::IndexerManager;
 use rsky_wintermute::ingester::pds_endpoint;
 use rsky_wintermute::reconcile::{Provenance, Source};
@@ -258,6 +268,9 @@ struct Report {
     /// Held records the repository doesn't have but that are newer than the
     /// download or carry no revision; never removed.
     kept: usize,
+    /// Likes, reposts, follows and blocks of a subject already held under
+    /// another URI; not written.
+    duplicates: usize,
     written: usize,
     deleted: usize,
     failed: usize,
@@ -286,14 +299,6 @@ struct Needed {
     need: Need,
 }
 
-/// A record the AppView holds for the account.
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct Held {
-    cid: String,
-    /// The repository revision it was indexed from, if one was kept.
-    rev: Option<String>,
-}
-
 /// How a repository and the records held for its account differ.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Plan {
@@ -307,13 +312,29 @@ struct Plan {
     kept: usize,
 }
 
-/// Compares a repository at revision `rev` (`collection/rkey` → CID) with the
-/// records held for the account (URI → CID and revision).
+/// How long before the download a record held only in its typed table must
+/// have been indexed to count as a missed delete.
+const TYPED_DELETE_MARGIN: chrono::TimeDelta = chrono::TimeDelta::minutes(1);
+
+/// Whether a record held only in its typed table, indexed at `indexed_at`,
+/// was there before a download that started at `download_started`.
+fn indexed_before(indexed_at: &str, download_started: chrono::DateTime<Utc>) -> bool {
+    chrono::DateTime::parse_from_rfc3339(indexed_at)
+        .is_ok_and(|at| at.with_timezone(&Utc) < download_started - TYPED_DELETE_MARGIN)
+}
+
+/// Compares a repository at revision `rev`, downloaded from
+/// `download_started` on (`collection/rkey` → CID), with the records held for
+/// the account (URI → CID and where it is held). A like, repost, follow or
+/// block in `untyped` is held in `record` but not in its typed table, so it
+/// counts as missing.
 fn plan(
     did: &str,
     rev: &str,
+    download_started: chrono::DateTime<Utc>,
     repo: &[(String, String)],
     held: &HashMap<String, Held>,
+    untyped: &HashSet<String>,
     allowed: impl Fn(&str) -> bool,
 ) -> Plan {
     let mut plan = Plan::default();
@@ -327,6 +348,7 @@ fn plan(
             _ if !indexed => None,
             None => Some(Need::Missing),
             Some(h) if h.cid != *cid => Some(Need::Changed),
+            Some(_) if untyped.contains(&uri) => Some(Need::Missing),
             Some(_) => None,
         };
         if let Some(need) = need {
@@ -345,27 +367,44 @@ fn plan(
         if in_repo.contains(uri) {
             continue;
         }
-        match &h.rev {
-            Some(held_rev) if held_rev.as_str() <= rev => plan.extra.push(uri.clone()),
-            _ => plan.kept += 1,
+        let removable = match &h.held_in {
+            HeldIn::Record {
+                rev: Some(held_rev),
+            } => held_rev.as_str() <= rev,
+            HeldIn::Record { rev: None } => false,
+            HeldIn::Typed { indexed_at } => indexed_before(indexed_at, download_started),
+        };
+        if removable {
+            plan.extra.push(uri.clone());
+        } else {
+            plan.kept += 1;
         }
     }
     plan.extra.sort();
     plan
 }
 
+/// Whether a needed record of `collection` is a like, repost, follow or
+/// block of a subject the account already has one of (`holds`), or that an
+/// earlier record of this repository is being written for (`writing`, which
+/// it joins otherwise).
+fn is_duplicate(
+    need: &Need,
+    collection: &str,
+    record: &serde_json::Value,
+    holds: impl Fn(&str, &str) -> bool,
+    writing: &mut HashSet<(String, String)>,
+) -> bool {
+    *need == Need::Missing
+        && held::subject_of(collection, record).is_some_and(|subject| {
+            holds(collection, &subject) || !writing.insert((collection.to_owned(), subject))
+        })
+}
+
 /// Whether `deletes` for a repository of `in_repo` records are out of
 /// proportion: more than the floor and more than `max_percent` of it.
 const fn deletes_out_of_proportion(deletes: usize, in_repo: usize, max_percent: usize) -> bool {
     deletes > DELETE_CAP_FLOOR && deletes.saturating_mul(100) > in_repo.saturating_mul(max_percent)
-}
-
-/// `collection` of an `at://did/collection/rkey` URI.
-fn collection_of(uri: &str) -> &str {
-    uri.trim_start_matches("at://")
-        .split('/')
-        .nth(1)
-        .unwrap_or("")
 }
 
 /// The outcome of [`apply_deletes`].
@@ -379,15 +418,18 @@ struct Deletes {
     counted: bool,
 }
 
-/// Removes records through the indexer at revision `rev`: it deletes a
-/// record only if that was indexed from `rev` or an older revision, and
-/// removes it as a live delete would.
+/// Removes records through the indexer at revision `rev`, as a live delete
+/// would. A record in `record` is deleted only if it was indexed from `rev`
+/// or an older revision; with `skip_boilerplate`, likes, reposts, follows and
+/// blocks are deleted from their typed tables whatever their revision, as the
+/// indexer does then.
 async fn apply_deletes(
     pool: &deadpool_postgres::Pool,
     uris: &[String],
     rev: &str,
     generation: Option<i64>,
     indexed_at: &str,
+    skip_boilerplate: bool,
 ) -> Deletes {
     let mut out = Deletes::default();
     for uri in uris {
@@ -403,13 +445,7 @@ async fn apply_deletes(
                 source: Source::Direct,
             }),
         };
-        let applied = match IndexerManager::process_job(
-            pool,
-            &job,
-            *rsky_wintermute::config::RECORD_SKIP_BOILERPLATE,
-        )
-        .await
-        {
+        let applied = match IndexerManager::process_job(pool, &job, skip_boilerplate).await {
             // The indexer answers Ok also when the revision kept the record.
             Ok(()) => still_held(pool, uri).await.map(|held| !held),
             Err(e) => Err(color_eyre::eyre::Report::from(e)),
@@ -434,10 +470,7 @@ async fn apply_deletes(
 
 async fn still_held(pool: &deadpool_postgres::Pool, uri: &str) -> Result<bool> {
     let client = pool.get().await?;
-    Ok(client
-        .query_opt("SELECT 1 FROM record WHERE uri = $1", &[&uri])
-        .await?
-        .is_some())
+    Ok(held::still_held(&client, uri).await?)
 }
 
 /// DIDs from the flags and the file, in order, without repeats.
@@ -470,6 +503,8 @@ struct Ctx {
     dry_run: bool,
     delete_extra: bool,
     max_delete_percent: usize,
+    /// `RECORD_SKIP_BOILERPLATE`, as the indexer runs with it.
+    skip_boilerplate: bool,
 }
 
 #[tokio::main]
@@ -551,9 +586,10 @@ async fn main() -> Result<()> {
         dry_run: args.dry_run,
         delete_extra: args.delete_extra,
         max_delete_percent: args.max_delete_percent,
+        skip_boilerplate: *rsky_wintermute::config::RECORD_SKIP_BOILERPLATE,
     });
     info!(
-        "{} accounts, {} at a time; {}{}",
+        "{} accounts, {} at a time; {}{}{}",
         dids.len(),
         args.concurrency,
         if args.dry_run { "dry run" } else { "WRITING" },
@@ -561,11 +597,16 @@ async fn main() -> Result<()> {
             ", deleting extra records"
         } else {
             ""
+        },
+        if ctx.skip_boilerplate {
+            "; likes, reposts, follows and blocks go to their tables only"
+        } else {
+            ""
         }
     );
 
     println!(
-        "did\tin_repo\tmissing\tchanged\textra\tkept\twritten\tdeleted\tfailed\tcar_bytes\tdeletes_refused\terror"
+        "did\tin_repo\tmissing\tchanged\textra\tkept\tduplicate\twritten\tdeleted\tfailed\tcar_bytes\tdeletes_refused\terror"
     );
     // The summed report, accounts with errors, accounts with deletes refused.
     let totals = Arc::new(Mutex::new((Report::default(), 0usize, 0usize)));
@@ -586,12 +627,13 @@ async fn main() -> Result<()> {
                     Err(e) => (Report::default(), e.to_string().replace(['\t', '\n'], " ")),
                 };
                 println!(
-                    "{did}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{error}",
+                    "{did}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{error}",
                     report.in_repo,
                     report.missing,
                     report.changed,
                     report.extra,
                     report.kept,
+                    report.duplicates,
                     report.written,
                     report.deleted,
                     report.failed,
@@ -613,6 +655,7 @@ async fn main() -> Result<()> {
                 sum.changed += report.changed;
                 sum.extra += report.extra;
                 sum.kept += report.kept;
+                sum.duplicates += report.duplicates;
                 sum.written += report.written;
                 sum.deleted += report.deleted;
                 sum.failed += report.failed;
@@ -632,14 +675,15 @@ async fn main() -> Result<()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     let (sum, errors, refused) = &*totals;
     info!(
-        "done: records in repositories {}, missing {}, changed {}, extra {}, kept {}, written {}, \
-         deleted {}, failed {}, downloaded {} MB, accounts with errors {}, accounts with deletes \
-         refused {}",
+        "done: records in repositories {}, missing {}, changed {}, extra {}, kept {}, duplicates {}, \
+         written {}, deleted {}, failed {}, downloaded {} MB, accounts with errors {}, accounts \
+         with deletes refused {}",
         sum.in_repo,
         sum.missing,
         sum.changed,
         sum.extra,
         sum.kept,
+        sum.duplicates,
         sum.written,
         sum.deleted,
         sum.failed,
@@ -666,6 +710,7 @@ fn by_count(counts: &HashMap<String, usize>) -> Vec<(&str, usize)> {
 }
 
 async fn fill_one(ctx: &Ctx, did: &str) -> Result<Report> {
+    let download_started = Utc::now();
     let resp = if let Some(host) = &ctx.repo_host {
         let url = reqwest::Url::parse_with_params(
             &format!(
@@ -738,22 +783,9 @@ async fn fill_one(ctx: &Ctx, did: &str) -> Result<Report> {
         .map_err(|e| eyre!("listing records: {e}"))?;
     let rev = repo.commit.rev.clone();
 
-    let held: HashMap<String, Held> = {
+    let holdings: Holdings = {
         let client = ctx.pool.get().await?;
-        client
-            .query("SELECT uri, cid, rev FROM record WHERE did = $1", &[&did])
-            .await?
-            .into_iter()
-            .map(|row| {
-                (
-                    row.get(0),
-                    Held {
-                        cid: row.get(1),
-                        rev: row.get(2),
-                    },
-                )
-            })
-            .collect()
+        held::holdings(&client, did).await?
     };
     let repo_records: Vec<(String, String)> = leaves
         .iter()
@@ -766,8 +798,10 @@ async fn fill_one(ctx: &Ctx, did: &str) -> Result<Report> {
     } = plan(
         did,
         &rev,
+        download_started,
         &repo_records,
-        &held,
+        &holdings.records,
+        &holdings.untyped,
         rsky_wintermute::config::ingest_collection_allowed,
     );
 
@@ -780,17 +814,6 @@ async fn fill_one(ctx: &Ctx, did: &str) -> Result<Report> {
             && deletes_out_of_proportion(extra.len(), repo_records.len(), ctx.max_delete_percent),
         ..Report::default()
     };
-    for n in &needed {
-        match n.need {
-            Need::Missing => report.missing += 1,
-            Need::Changed => report.changed += 1,
-        }
-        let collection = n.key.split_once('/').map_or("", |(c, _)| c);
-        *report
-            .needed_by_collection
-            .entry(collection.to_owned())
-            .or_default() += 1;
-    }
     for uri in &extra {
         *report
             .extra_by_collection
@@ -802,57 +825,100 @@ async fn fill_one(ctx: &Ctx, did: &str) -> Result<Report> {
     } else {
         &[]
     };
-    if ctx.dry_run || (needed.is_empty() && deletes.is_empty()) {
-        return Ok(report);
-    }
+    let deleting: HashSet<&str> = deletes.iter().map(String::as_str).collect();
 
+    // Read the needed records from the repository. A like, repost, follow or
+    // block of a subject the account already has one of is a duplicate: its
+    // typed table keeps one per subject, so writing it would change nothing.
+    // One whose subject is held only by a record deleted now (an unlike and
+    // a like again, both missed) is written, after that delete.
     let cids: HashMap<&str, _> = leaves
         .iter()
         .map(|leaf| (leaf.key.as_str(), leaf.value))
         .collect();
-    let wanted: Vec<_> = needed
-        .iter()
-        .filter_map(|n| cids.get(n.key.as_str()).copied())
-        .collect();
     let found = {
+        let wanted: Vec<_> = needed
+            .iter()
+            .filter_map(|n| cids.get(n.key.as_str()).copied())
+            .collect();
         let storage = repo.storage.read().await;
         storage
             .get_blocks(wanted)
             .await
             .map_err(|e| eyre!("reading records: {e}"))?
     };
-    let generation = rsky_wintermute::reconcile::current_generation(&ctx.pool, did).await?;
-    let now = Utc::now();
-    let mut wrote_counted = false;
+    let mut to_write: Vec<(&Needed, serde_json::Value)> = Vec::with_capacity(needed.len());
+    let mut subjects_written = HashSet::new();
     for n in &needed {
-        let Some(cid) = cids.get(n.key.as_str()).copied() else {
-            report.failed += 1;
-            continue;
-        };
-        let Ok(parsed) = get_and_parse_record(&found.blocks, cid) else {
+        let Some(parsed) = cids
+            .get(n.key.as_str())
+            .and_then(|cid| get_and_parse_record(&found.blocks, *cid).ok())
+        else {
             report.failed += 1;
             continue;
         };
         let raw = serde_json::to_value(&parsed.record)?;
+        let collection = n.key.split_once('/').map_or("", |(c, _)| c);
+        if is_duplicate(
+            &n.need,
+            collection,
+            &raw,
+            |c, s| {
+                holdings
+                    .subject_held_by(c, s)
+                    .is_some_and(|uri| !deleting.contains(uri))
+            },
+            &mut subjects_written,
+        ) {
+            report.duplicates += 1;
+            continue;
+        }
+        match n.need {
+            Need::Missing => report.missing += 1,
+            Need::Changed => report.changed += 1,
+        }
+        *report
+            .needed_by_collection
+            .entry(collection.to_owned())
+            .or_default() += 1;
+        to_write.push((n, raw));
+    }
+    if ctx.dry_run || (to_write.is_empty() && deletes.is_empty()) {
+        return Ok(report);
+    }
+
+    let generation = rsky_wintermute::reconcile::current_generation(&ctx.pool, did).await?;
+    let now = Utc::now();
+    // Deletes first: a record written for a subject a deleted one held is
+    // refused by the typed table while that one is still there.
+    let deleted = apply_deletes(
+        &ctx.pool,
+        deletes,
+        &rev,
+        generation,
+        &now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
+        ctx.skip_boilerplate,
+    )
+    .await;
+    report.deleted = deleted.deleted;
+    report.kept += deleted.kept;
+    report.failed += deleted.failed;
+
+    let mut wrote_counted = false;
+    for (n, raw) in &to_write {
         let job = IndexJob {
             uri: n.uri.clone(),
             cid: n.cid.clone(),
             action: WriteAction::Create,
-            indexed_at: repaired_indexed_at(&raw, now),
-            record: Some(convert_record_to_ipld(&raw)),
+            indexed_at: repaired_indexed_at(raw, now),
+            record: Some(convert_record_to_ipld(raw)),
             rev: rev.clone(),
             provenance: Some(Provenance {
                 generation,
                 source: Source::Direct,
             }),
         };
-        match IndexerManager::process_job(
-            &ctx.pool,
-            &job,
-            *rsky_wintermute::config::RECORD_SKIP_BOILERPLATE,
-        )
-        .await
-        {
+        match IndexerManager::process_job(&ctx.pool, &job, ctx.skip_boilerplate).await {
             Ok(()) => {
                 report.written += 1;
                 wrote_counted |= n.key.starts_with("app.bsky.feed.post/")
@@ -864,18 +930,6 @@ async fn fill_one(ctx: &Ctx, did: &str) -> Result<Report> {
             }
         }
     }
-
-    let deleted = apply_deletes(
-        &ctx.pool,
-        deletes,
-        &rev,
-        generation,
-        &now.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string(),
-    )
-    .await;
-    report.deleted = deleted.deleted;
-    report.kept += deleted.kept;
-    report.failed += deleted.failed;
 
     // The profile's post and follow counts, as direct_index recomputes them.
     if wrote_counted || deleted.counted {
@@ -975,6 +1029,7 @@ async fn list_active_repos(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rsky_repo::types::{RecordCreateOrUpdateOp, WriteOpAction};
 
     const DID: &str = "did:plc:fillgapstest";
     /// The revision of the downloaded repository in the plan tests.
@@ -997,7 +1052,31 @@ mod tests {
                     format!("at://{DID}/{k}"),
                     Held {
                         cid: (*c).to_owned(),
-                        rev: rev.map(str::to_owned),
+                        held_in: HeldIn::Record {
+                            rev: rev.map(str::to_owned),
+                        },
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// When the download of the plan tests started.
+    fn started() -> chrono::DateTime<Utc> {
+        "2026-11-25T12:00:00Z".parse().unwrap()
+    }
+
+    fn typed(entries: &[(&str, &str, &str)]) -> HashMap<String, Held> {
+        entries
+            .iter()
+            .map(|(k, c, indexed_at)| {
+                (
+                    format!("at://{DID}/{k}"),
+                    Held {
+                        cid: (*c).to_owned(),
+                        held_in: HeldIn::Typed {
+                            indexed_at: (*indexed_at).to_owned(),
+                        },
                     },
                 )
             })
@@ -1026,7 +1105,7 @@ mod tests {
             ("app.bsky.graph.follow/d", "cid-d"),
         ]);
 
-        let plan = plan(DID, REV, &repo, &held, |_| true);
+        let plan = plan(DID, REV, started(), &repo, &held, &HashSet::new(), |_| true);
 
         assert_eq!(
             plan.needed,
@@ -1059,9 +1138,15 @@ mod tests {
             ("app.bsky.feed.post/a", "cid-a"),
             ("chat.bsky.actor.declaration/self", "cid-x"),
         ]);
-        let plan = plan(DID, REV, &repo, &HashMap::new(), |c| {
-            c == "app.bsky.feed.post"
-        });
+        let plan = plan(
+            DID,
+            REV,
+            started(),
+            &repo,
+            &HashMap::new(),
+            &HashSet::new(),
+            |c| c == "app.bsky.feed.post",
+        );
         assert_eq!(plan.needed.len(), 1);
         assert_eq!(plan.needed[0].key, "app.bsky.feed.post/a");
         assert!(plan.extra.is_empty());
@@ -1075,9 +1160,15 @@ mod tests {
             ("app.bsky.feed.post/a", "cid-a"),
             ("chat.bsky.actor.declaration/self", "cid-x"),
         ];
-        let plan = plan(DID, REV, &repo(&entries), &held(&entries), |c| {
-            c == "app.bsky.feed.post"
-        });
+        let plan = plan(
+            DID,
+            REV,
+            started(),
+            &repo(&entries),
+            &held(&entries),
+            &HashSet::new(),
+            |c| c == "app.bsky.feed.post",
+        );
         assert_eq!(plan, Plan::default());
     }
 
@@ -1089,7 +1180,7 @@ mod tests {
             ("app.bsky.feed.like/newer", "c3", Some("3mzzzzzzzzzz2")),
             ("app.bsky.feed.like/unversioned", "c4", None),
         ]);
-        let plan = plan(DID, REV, &[], &held, |_| true);
+        let plan = plan(DID, REV, started(), &[], &held, &HashSet::new(), |_| true);
         assert_eq!(
             plan.extra,
             vec![
@@ -1106,8 +1197,117 @@ mod tests {
             ("app.bsky.feed.post/a", "cid-a"),
             ("app.bsky.feed.like/b", "cid-b"),
         ];
-        let plan = plan(DID, REV, &repo(&entries), &held(&entries), |_| true);
+        let plan = plan(
+            DID,
+            REV,
+            started(),
+            &repo(&entries),
+            &held(&entries),
+            &HashSet::new(),
+            |_| true,
+        );
         assert_eq!(plan, Plan::default());
+    }
+
+    #[test]
+    fn plan_removes_a_typed_only_record_only_if_indexed_before_the_download() {
+        let held = typed(&[
+            (
+                "app.bsky.feed.like/hour-before",
+                "c1",
+                "2026-11-25T11:00:00.000Z",
+            ),
+            (
+                "app.bsky.feed.like/seconds-before",
+                "c2",
+                "2026-11-25T11:59:30.000Z",
+            ),
+            ("app.bsky.feed.like/after", "c3", "2026-11-25T12:00:05.000Z"),
+            ("app.bsky.feed.like/unreadable", "c4", "yesterday"),
+        ]);
+        let plan = plan(DID, REV, started(), &[], &held, &HashSet::new(), |_| true);
+        assert_eq!(
+            plan.extra,
+            vec![format!("at://{DID}/app.bsky.feed.like/hour-before")]
+        );
+        assert_eq!(
+            plan.kept, 3,
+            "within the margin, after the download started, or no readable time"
+        );
+    }
+
+    #[test]
+    fn plan_compares_typed_only_records_by_cid() {
+        let repo = repo(&[
+            ("app.bsky.feed.like/same", "c1"),
+            ("app.bsky.graph.follow/changed", "c2-new"),
+        ]);
+        let held = typed(&[
+            ("app.bsky.feed.like/same", "c1", "2026-11-25T11:00:00.000Z"),
+            (
+                "app.bsky.graph.follow/changed",
+                "c2-old",
+                "2026-11-25T11:00:00.000Z",
+            ),
+        ]);
+        let plan = plan(DID, REV, started(), &repo, &held, &HashSet::new(), |_| true);
+        assert_eq!(plan.needed.len(), 1);
+        assert_eq!(plan.needed[0].key, "app.bsky.graph.follow/changed");
+        assert_eq!(plan.needed[0].need, Need::Changed);
+        assert!(plan.extra.is_empty());
+    }
+
+    #[test]
+    fn duplicates_are_second_likes_of_a_held_or_written_subject() {
+        let post = "at://did:plc:b/app.bsky.feed.post/p";
+        let like = serde_json::json!({"subject": {"uri": post, "cid": "c"}});
+        let follow = serde_json::json!({"subject": "did:plc:c"});
+        let held_post = |c: &str, s: &str| c == "app.bsky.feed.like" && s == post;
+        let nothing = |_: &str, _: &str| false;
+        let mut writing = HashSet::new();
+
+        assert!(is_duplicate(
+            &Need::Missing,
+            "app.bsky.feed.like",
+            &like,
+            held_post,
+            &mut writing
+        ));
+        assert!(
+            !is_duplicate(
+                &Need::Changed,
+                "app.bsky.feed.like",
+                &like,
+                held_post,
+                &mut writing
+            ),
+            "a held record in a new version is no duplicate"
+        );
+        assert!(!is_duplicate(
+            &Need::Missing,
+            "app.bsky.graph.follow",
+            &follow,
+            nothing,
+            &mut writing
+        ));
+        assert!(
+            is_duplicate(
+                &Need::Missing,
+                "app.bsky.graph.follow",
+                &follow,
+                nothing,
+                &mut writing
+            ),
+            "a second follow of the same account in one repository"
+        );
+        let post_record = serde_json::json!({"text": "hi"});
+        assert!(!is_duplicate(
+            &Need::Missing,
+            "app.bsky.feed.post",
+            &post_record,
+            nothing,
+            &mut writing
+        ));
     }
 
     #[test]
@@ -1315,15 +1515,6 @@ mod tests {
         rest.assert_async().await;
     }
 
-    #[test]
-    fn collection_of_a_uri() {
-        assert_eq!(
-            collection_of("at://did:plc:a/app.bsky.feed.like/3k"),
-            "app.bsky.feed.like"
-        );
-        assert_eq!(collection_of("at://did:plc:a"), "");
-    }
-
     fn test_pool() -> deadpool_postgres::Pool {
         let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
             "postgresql://postgres:postgres@localhost:5432/bsky_test".to_owned()
@@ -1379,6 +1570,7 @@ mod tests {
             "3mmmmmmmmmmm2",
             None,
             "2026-11-24T00:00:00.000Z",
+            false,
         )
         .await;
 
@@ -1407,6 +1599,374 @@ mod tests {
             .map(|row| row.get(0))
             .collect();
         assert_eq!(likes, vec![newer]);
+    }
+
+    fn keypair() -> secp256k1::Keypair {
+        let seed: [u8; 32] = rand::random();
+        secp256k1::Keypair::from_seckey_slice(secp256k1::SECP256K1, &seed).unwrap()
+    }
+
+    fn like(rkey: &str, post: &str) -> RecordCreateOrUpdateOp {
+        RecordCreateOrUpdateOp {
+            action: WriteOpAction::Create,
+            collection: "app.bsky.feed.like".to_owned(),
+            rkey: rkey.to_owned(),
+            record: serde_json::from_value(serde_json::json!({
+                "$type": "app.bsky.feed.like",
+                "subject": {"uri": post, "cid": "bafyreihhl5mpvjkrhnnagen2fomozzhnhhdq2jr6cego2nzbvmwewv5rd4"},
+                "createdAt": "2026-07-01T00:00:00.000Z",
+            }))
+            .unwrap(),
+        }
+    }
+
+    /// A repository of `did` holding `writes`: the CAR `getRepo` serves, its
+    /// revision, and its records' CIDs by `collection/rkey`.
+    async fn repo_car(
+        did: &str,
+        writes: Vec<RecordCreateOrUpdateOp>,
+    ) -> (Vec<u8>, String, HashMap<String, String>) {
+        let storage = Arc::new(tokio::sync::RwLock::new(
+            MemoryBlockstore::new(None).await.unwrap(),
+        ));
+        let mut repo = rsky_repo::repo::Repo::create(
+            storage.clone(),
+            did.to_owned(),
+            &keypair(),
+            Some(writes),
+        )
+        .await
+        .unwrap();
+        let cids = repo
+            .data
+            .list(None, None, None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|leaf| (leaf.key, leaf.value.to_string()))
+            .collect();
+        let car: Vec<u8> = rsky_repo::sync::provider::get_full_repo(storage, repo.cid)
+            .await
+            .unwrap()
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .flat_map(Result::unwrap)
+            .collect();
+        (car, repo.commit.rev.clone(), cids)
+    }
+
+    fn test_ctx(pool: deadpool_postgres::Pool, repo_host: String, skip_boilerplate: bool) -> Ctx {
+        Ctx {
+            pool,
+            http: reqwest::Client::new(),
+            host_http: reqwest::Client::new(),
+            repo_host: Some(repo_host),
+            limiter: None,
+            resolver: IdResolver::new(IdentityResolverOpts {
+                timeout: None,
+                plc_url: None,
+                did_cache: None,
+                backup_nameservers: None,
+            }),
+            max_car_bytes: usize::MAX,
+            dry_run: false,
+            delete_extra: true,
+            max_delete_percent: 25,
+            skip_boilerplate,
+        }
+    }
+
+    async fn clean(pool: &deadpool_postgres::Pool, did: &str) {
+        let client = pool.get().await.unwrap();
+        for sql in [
+            "DELETE FROM \"like\" WHERE creator = $1",
+            "DELETE FROM post WHERE creator = $1",
+            "DELETE FROM feed_item WHERE \"originatorDid\" = $1",
+            "DELETE FROM notification WHERE author = $1",
+            "DELETE FROM record WHERE did = $1",
+        ] {
+            client.execute(sql, &[&did]).await.unwrap();
+        }
+    }
+
+    /// Indexes a like as the indexer would have, long ago.
+    async fn index_like(
+        pool: &deadpool_postgres::Pool,
+        uri: &str,
+        cid: &str,
+        post: &str,
+        indexed_at: &str,
+        skip_boilerplate: bool,
+    ) {
+        let job = IndexJob {
+            uri: uri.to_owned(),
+            cid: cid.to_owned(),
+            action: WriteAction::Create,
+            record: Some(serde_json::json!({
+                "$type": "app.bsky.feed.like",
+                "subject": {"uri": post, "cid": "bafypost"},
+                "createdAt": "2026-07-01T00:00:00.000Z",
+            })),
+            indexed_at: indexed_at.to_owned(),
+            rev: "3aaaaaaaaaaa2".to_owned(),
+            provenance: None,
+        };
+        IndexerManager::process_job(pool, &job, skip_boilerplate)
+            .await
+            .unwrap();
+    }
+
+    async fn uris(pool: &deadpool_postgres::Pool, sql: &str, did: &str) -> Vec<String> {
+        let client = pool.get().await.unwrap();
+        let mut uris: Vec<String> = client
+            .query(sql, &[&did])
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        uris.sort();
+        uris
+    }
+
+    #[tokio::test]
+    async fn an_unlike_and_a_like_again_both_missed_end_with_the_new_like() {
+        for skip in [false, true] {
+            let did = "did:plc:fillgapsrelike";
+            let post = "at://did:plc:fillgapsauthor/app.bsky.feed.post/p";
+            let pool = test_pool();
+            clean(&pool, did).await;
+            // Held: the first like. The repository: only the second one.
+            let first = format!("at://{did}/app.bsky.feed.like/3maaaaaaaaaa2");
+            let second = format!("at://{did}/app.bsky.feed.like/3mbbbbbbbbbb2");
+            index_like(
+                &pool,
+                &first,
+                "bafyfirst",
+                post,
+                "2026-07-01T00:00:00.000Z",
+                skip,
+            )
+            .await;
+            let (car, _, _) = repo_car(did, vec![like("3mbbbbbbbbbb2", post)]).await;
+            let mut server = mockito::Server::new_async().await;
+            let get_repo = server
+                .mock("GET", "/xrpc/com.atproto.sync.getRepo")
+                .match_query(mockito::Matcher::UrlEncoded("did".into(), did.into()))
+                .with_body(car)
+                .create_async()
+                .await;
+
+            let ctx = test_ctx(pool.clone(), server.url(), skip);
+            let report = fill_one(&ctx, did).await.unwrap();
+
+            get_repo.assert_async().await;
+            assert_eq!(
+                (
+                    report.extra,
+                    report.deleted,
+                    report.missing,
+                    report.written,
+                    report.duplicates
+                ),
+                (1, 1, 1, 1, 0),
+                "skip {skip}: {report:?}"
+            );
+            assert_eq!(
+                uris(&pool, "SELECT uri FROM \"like\" WHERE creator = $1", did).await,
+                vec![second.clone()],
+                "skip {skip}: the account still likes the post"
+            );
+            let in_record = uris(&pool, "SELECT uri FROM record WHERE did = $1", did).await;
+            if skip {
+                assert!(in_record.is_empty(), "{in_record:?}");
+            } else {
+                assert_eq!(in_record, vec![second]);
+            }
+            clean(&pool, did).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_like_held_only_in_record_gets_its_row_back() {
+        let did = "did:plc:fillgapsuntyped";
+        let lost_post = "at://did:plc:fillgapsauthor/app.bsky.feed.post/lost";
+        let twice_post = "at://did:plc:fillgapsauthor/app.bsky.feed.post/twice";
+        let pool = test_pool();
+        clean(&pool, did).await;
+        let (car, _, cids) = repo_car(
+            did,
+            vec![
+                like("3mlostlostlo2", lost_post),
+                like("3mfirstfirst2", twice_post),
+                like("3msecondseco2", twice_post),
+            ],
+        )
+        .await;
+        // The first like of `twice_post` is held as usual. The other two have
+        // a record row only: the lost one, and the second like of a post.
+        let first = format!("at://{did}/app.bsky.feed.like/3mfirstfirst2");
+        index_like(
+            &pool,
+            &first,
+            &cids["app.bsky.feed.like/3mfirstfirst2"],
+            twice_post,
+            "2026-07-01T00:00:00.000Z",
+            false,
+        )
+        .await;
+        let client = pool.get().await.unwrap();
+        for rkey in ["3mlostlostlo2", "3msecondseco2"] {
+            client
+                .execute(
+                    "INSERT INTO record (uri, cid, did, json, rev, \"indexedAt\") \
+                     VALUES ($1, $2, $3, '{}', '3aaaaaaaaaaa2', '2026-07-01T00:00:00.000Z')",
+                    &[
+                        &format!("at://{did}/app.bsky.feed.like/{rkey}"),
+                        &cids[&format!("app.bsky.feed.like/{rkey}")],
+                        &did,
+                    ],
+                )
+                .await
+                .unwrap();
+        }
+        drop(client);
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/xrpc/com.atproto.sync.getRepo")
+            .match_query(mockito::Matcher::Any)
+            .with_body(car)
+            .create_async()
+            .await;
+
+        let report = fill_one(&test_ctx(pool.clone(), server.url(), false), did)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (
+                report.missing,
+                report.duplicates,
+                report.written,
+                report.extra
+            ),
+            (1, 1, 1, 0),
+            "{report:?}"
+        );
+        assert_eq!(
+            uris(&pool, "SELECT uri FROM \"like\" WHERE creator = $1", did).await,
+            vec![
+                first,
+                format!("at://{did}/app.bsky.feed.like/3mlostlostlo2")
+            ]
+        );
+        clean(&pool, did).await;
+    }
+
+    #[tokio::test]
+    async fn with_the_switch_on_likes_are_compared_with_their_table() {
+        let did = "did:plc:fillgapstyped";
+        let liked = "at://did:plc:fillgapsauthor/app.bsky.feed.post/liked";
+        let pool = test_pool();
+        clean(&pool, did).await;
+        let post_write = RecordCreateOrUpdateOp {
+            action: WriteOpAction::Create,
+            collection: "app.bsky.feed.post".to_owned(),
+            rkey: "3mpostpostpo2".to_owned(),
+            record: serde_json::from_value(serde_json::json!({
+                "$type": "app.bsky.feed.post",
+                "text": "missed",
+                "createdAt": "2026-07-01T00:00:00.000Z",
+            }))
+            .unwrap(),
+        };
+        // The repository: a held like, a second like of the same post, and a
+        // post the AppView missed.
+        let (car, _, cids) = repo_car(
+            did,
+            vec![
+                like("3mheldheldhe2", liked),
+                like("3mtwicetwice2", liked),
+                post_write,
+            ],
+        )
+        .await;
+        let held = format!("at://{did}/app.bsky.feed.like/3mheldheldhe2");
+        let unliked = format!("at://{did}/app.bsky.feed.like/3mgonegonego2");
+        let recent = format!("at://{did}/app.bsky.feed.like/3mnewnewnewn2");
+        let later = Utc::now() + chrono::TimeDelta::hours(1);
+        let later = later.format("%Y-%m-%dT%H:%M:%S%.3fZ").to_string();
+        index_like(
+            &pool,
+            &held,
+            &cids["app.bsky.feed.like/3mheldheldhe2"],
+            liked,
+            "2026-07-01T00:00:00.000Z",
+            true,
+        )
+        .await;
+        index_like(
+            &pool,
+            &unliked,
+            "bafygone",
+            "at://did:plc:fillgapsauthor/app.bsky.feed.post/other",
+            "2026-07-02T00:00:00.000Z",
+            true,
+        )
+        .await;
+        index_like(
+            &pool,
+            &recent,
+            "bafynew",
+            "at://did:plc:fillgapsauthor/app.bsky.feed.post/new",
+            &later,
+            true,
+        )
+        .await;
+        assert!(
+            uris(&pool, "SELECT uri FROM record WHERE did = $1", did)
+                .await
+                .is_empty(),
+            "with the switch on, likes have no record row"
+        );
+        let mut server = mockito::Server::new_async().await;
+        server
+            .mock("GET", "/xrpc/com.atproto.sync.getRepo")
+            .match_query(mockito::Matcher::Any)
+            .with_body(car)
+            .create_async()
+            .await;
+
+        let ctx = test_ctx(pool.clone(), server.url(), true);
+        let report = fill_one(&ctx, did).await.unwrap();
+
+        assert_eq!(report.in_repo, 3);
+        assert_eq!(report.missing, 1, "only the post: {report:?}");
+        assert_eq!(
+            report.needed_by_collection.keys().collect::<Vec<_>>(),
+            vec!["app.bsky.feed.post"]
+        );
+        assert_eq!(report.duplicates, 1, "the second like of the same post");
+        assert_eq!(
+            (report.extra, report.deleted),
+            (1, 1),
+            "the like no longer in the repository"
+        );
+        assert_eq!(
+            report.kept, 1,
+            "the like indexed after the download started"
+        );
+        assert_eq!(report.written, 1);
+        assert_eq!(
+            uris(&pool, "SELECT uri FROM \"like\" WHERE creator = $1", did).await,
+            vec![held, recent]
+        );
+        assert_eq!(
+            uris(&pool, "SELECT uri FROM record WHERE did = $1", did).await,
+            vec![format!("at://{did}/app.bsky.feed.post/3mpostpostpo2")]
+        );
+        clean(&pool, did).await;
     }
 
     #[test]

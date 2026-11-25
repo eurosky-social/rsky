@@ -85,6 +85,7 @@ async fn main() -> Result<()> {
             reset_to_repo: args.reset_to_repo,
             break_glass: args.break_glass,
             dry_run: args.dry_run,
+            skip_boilerplate: *rsky_wintermute::config::RECORD_SKIP_BOILERPLATE,
         },
     )
     .await?;

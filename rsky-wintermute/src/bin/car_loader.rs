@@ -535,20 +535,21 @@ fn uri_collection(uri: &str) -> Option<&str> {
     uri.split('/').nth(3)
 }
 
-/// Delete this repo's DB records that are absent from the freshly parsed CAR. Safe to run
-/// before the repo's inserts: the stale and incoming URI sets are disjoint.
+/// Delete this repo's DB records that are absent from the freshly parsed CAR, from `record`
+/// and the typed tables (likes, reposts, follows and blocks written with
+/// `RECORD_SKIP_BOILERPLATE` are only there). Safe to run before the repo's inserts: the stale
+/// and incoming URI sets are disjoint.
 async fn reconcile_stale_records(pool: &Pool, parsed: &ParsedRepo) -> Result<()> {
     let parsed_uris: std::collections::HashSet<&str> =
         parsed.jobs.iter().map(|j| j.uri.as_str()).collect();
     let client = pool.get().await?;
-    let rows = client
-        .query("SELECT uri FROM record WHERE did = $1", &[&parsed.did])
-        .await?;
-    let stale: Vec<String> = rows
-        .into_iter()
-        .map(|r| r.get::<_, String>(0))
+    let mut stale: Vec<String> = rsky_wintermute::held::holdings(&client, &parsed.did)
+        .await?
+        .records
+        .into_keys()
         .filter(|u| !parsed_uris.contains(u.as_str()))
         .collect();
+    stale.sort();
     if stale.is_empty() {
         return Ok(());
     }
@@ -835,7 +836,71 @@ async fn load_single_repo(args: &Args, pool: &Pool, did: &str) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{collection_tables, manifest_rev_is_newer, uri_collection};
+    use super::{
+        IndexJob, IndexerManager, ParsedRepo, WriteAction, collection_tables,
+        manifest_rev_is_newer, reconcile_stale_records, uri_collection,
+    };
+
+    #[tokio::test]
+    async fn stale_cleanup_removes_likes_held_only_in_their_table() {
+        let url = std::env::var("DATABASE_URL").unwrap_or_else(|_| {
+            "postgresql://postgres:postgres@localhost:5432/bsky_test".to_owned()
+        });
+        let pool = rsky_wintermute::config::create_pg_pool(
+            &url,
+            rsky_wintermute::config::pg_pool_config(2),
+        )
+        .unwrap();
+        let did = "did:plc:carloaderstale";
+        let client = pool.get().await.unwrap();
+        for table in ["\"like\"", "notification"] {
+            let column = if table == "notification" {
+                "author"
+            } else {
+                "creator"
+            };
+            client
+                .execute(&format!("DELETE FROM {table} WHERE {column} = $1"), &[&did])
+                .await
+                .unwrap();
+        }
+        let job = |rkey: &str, post: &str| IndexJob {
+            uri: format!("at://{did}/app.bsky.feed.like/{rkey}"),
+            cid: format!("bafy{rkey}"),
+            action: WriteAction::Create,
+            record: Some(serde_json::json!({
+                "$type": "app.bsky.feed.like",
+                "subject": {"uri": format!("at://did:plc:carloaderauthor/app.bsky.feed.post/{post}"), "cid": "bafypost"},
+                "createdAt": "2026-01-01T00:00:00.000Z",
+            })),
+            indexed_at: "2026-01-01T00:00:00.000Z".to_owned(),
+            rev: "3aaaaaaaaaaa2".to_owned(),
+            provenance: None,
+        };
+        let kept = job("kept", "p1");
+        for like in [&kept, &job("stale", "p2")] {
+            // With the switch on: no record row, only the like table.
+            IndexerManager::process_job(&pool, like, true)
+                .await
+                .unwrap();
+        }
+
+        let parsed = ParsedRepo {
+            did: did.to_owned(),
+            jobs: vec![kept.clone()],
+            record_failures: Vec::new(),
+        };
+        reconcile_stale_records(&pool, &parsed).await.unwrap();
+
+        let likes: Vec<String> = client
+            .query("SELECT uri FROM \"like\" WHERE creator = $1", &[&did])
+            .await
+            .unwrap()
+            .iter()
+            .map(|row| row.get(0))
+            .collect();
+        assert_eq!(likes, vec![kept.uri]);
+    }
 
     #[test]
     fn rev_compare_decides_delta_load() {
