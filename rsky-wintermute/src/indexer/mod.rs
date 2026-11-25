@@ -1,5 +1,6 @@
 pub(crate) mod bulk;
 mod calendar;
+mod media_time;
 mod tests;
 
 use crate::SHUTDOWN;
@@ -2237,6 +2238,12 @@ impl IndexerManager {
                         client
                             .execute("DELETE FROM feed_item WHERE uri = ANY($1)", &[&group_uris])
                             .await?;
+                        client
+                            .execute(
+                                "DELETE FROM post_media_time WHERE \"postUri\" = ANY($1)",
+                                &[&group_uris],
+                            )
+                            .await?;
                         if !bulk_load {
                             bulk::decrement_profile_agg(&client, "postsCount", creators).await?;
                             bulk::decrement_post_agg(&client, "replyCount", parents).await?;
@@ -3384,6 +3391,7 @@ impl IndexerManager {
         let mut embed_image_data: Vec<(String, String, String, String)> = Vec::new();
         let mut embed_gallery_data: Vec<(String, String, String, String)> = Vec::new();
         let mut embed_video_data: Vec<(String, String, Option<String>)> = Vec::new();
+        let mut media_time_data: Vec<media_time::MediaTimeRow> = Vec::new();
         let mut quote_data: Vec<(String, String, String, String, String, String)> = Vec::new();
         let mut notif_rows: Vec<bulk::NotificationRow> = Vec::new();
         // (did, uri, cid, sort_at) for reply posts; ancestor notifications need queries
@@ -3436,6 +3444,12 @@ impl IndexerManager {
                     .map(|items| bulk::pg_text_array_literal(items));
 
                 let is_reply = reply_parent.is_some();
+                // Eurosky: a reply that names a second of the video it answers
+                if let (Some(parent), Some(seconds)) =
+                    (&reply_parent, media_time::media_time_seconds(record))
+                {
+                    media_time_data.push((uri.clone(), parent.clone(), seconds));
+                }
                 post_data.push(bulk::PostCopyRow {
                     uri: uri.clone(),
                     cid: pj.job.cid.clone(),
@@ -3556,6 +3570,7 @@ impl IndexerManager {
                 )
                 .await?;
                 bulk::copy_insert_post_embed_videos(client, &embed_video_data).await?;
+                media_time::insert_media_times(client, &media_time_data).await?;
                 bulk::copy_insert_quotes(client, &quote_data, compute_agg).await
             },
             async {
@@ -4261,6 +4276,15 @@ impl IndexerManager {
                     &[&parent_uri_str],
                 )
                 .await?;
+
+            // Eurosky: a reply that names a second of the video it answers
+            if let Some(seconds) = media_time::media_time_seconds(record) {
+                media_time::insert_media_times(
+                    client,
+                    &[(uri.clone(), parent_uri_str.to_owned(), seconds)],
+                )
+                .await?;
+            }
         }
 
         // Handle embed.record (quote posts)
@@ -4585,6 +4609,12 @@ impl IndexerManager {
             .await?;
         client
             .execute("DELETE FROM feed_item WHERE uri = $1", &[&uri])
+            .await?;
+        client
+            .execute(
+                "DELETE FROM post_media_time WHERE \"postUri\" = $1",
+                &[&uri],
+            )
             .await?;
 
         if let Some(row) = deleted.first() {

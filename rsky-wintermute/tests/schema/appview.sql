@@ -846,6 +846,16 @@ CREATE TABLE post_embed_video (
 );
 
 --
+-- Name: post_media_time; Type: TABLE
+--
+
+CREATE TABLE post_media_time (
+    "postUri" character varying NOT NULL,
+    "parentUri" character varying NOT NULL,
+    seconds integer NOT NULL
+);
+
+--
 -- Name: post_gate; Type: TABLE
 --
 
@@ -1482,6 +1492,13 @@ ALTER TABLE ONLY post_embed_video
     ADD CONSTRAINT post_embed_video_pkey PRIMARY KEY ("postUri");
 
 --
+-- Name: post_media_time post_media_time_pkey; Type: CONSTRAINT
+--
+
+ALTER TABLE ONLY post_media_time
+    ADD CONSTRAINT post_media_time_pkey PRIMARY KEY ("postUri");
+
+--
 -- Name: post_gate post_gate_pkey; Type: CONSTRAINT
 --
 
@@ -1875,6 +1892,12 @@ CREATE INDEX peer_mod_label_subject_peer_idx ON peer_mod_label USING btree ("sub
 --
 
 CREATE INDEX post_creator_cursor_idx ON post USING btree (creator, "sortAt", cid);
+
+--
+-- Name: post_media_time_parent_idx; Type: INDEX
+--
+
+CREATE INDEX post_media_time_parent_idx ON post_media_time USING btree ("parentUri", seconds);
 
 --
 -- Name: post_order_by_idx; Type: INDEX

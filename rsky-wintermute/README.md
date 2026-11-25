@@ -491,6 +491,9 @@ Requires a PostgreSQL database with the bsky dataplane schema. Tables include:
 - `record`, `sub_state`
 - `verification`
 - `calendar_event`, `calendar_rsvp`
+- `post_media_time` (Eurosky: replies that name a second of a video, from the
+  `network.eurosky.mediaTime` field; created by the AppView's dataplane
+  migration, so deploy that AppView before a wintermute that writes it)
 
 ## Running the database-backed tests
 
