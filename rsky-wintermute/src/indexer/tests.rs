@@ -2141,6 +2141,129 @@ mod indexer_tests {
     }
 
     #[tokio::test]
+    async fn linked_replies_are_kept_in_post_media_time_on_the_live_and_bulk_paths() {
+        use crate::types::IndexJob;
+
+        let pool = setup_test_pool();
+        let test_did = "did:plc:wintermute-test-media-time";
+        let video = "at://did:plc:wintermute-test-video/app.bsky.feed.post/video";
+        let client = pool.get().await.unwrap();
+        let clear_rows = || async {
+            client
+                .execute(
+                    "DELETE FROM post_media_time WHERE \"postUri\" LIKE $1",
+                    &[&format!("at://{test_did}/%")],
+                )
+                .await
+                .unwrap();
+        };
+        cleanup_test_data(&pool, test_did).await;
+        clear_rows().await;
+
+        let reply = serde_json::json!({
+            "root": {"uri": video, "cid": "bafyvideo"},
+            "parent": {"uri": video, "cid": "bafyvideo"},
+        });
+        let job = |rkey: &str, extra: serde_json::Value| {
+            let mut record = serde_json::json!({
+                "$type": "app.bsky.feed.post",
+                "text": rkey,
+                "createdAt": "2026-11-25T10:00:00.000Z",
+            });
+            if let (Some(record), Some(extra)) = (record.as_object_mut(), extra.as_object()) {
+                record.extend(extra.clone());
+            }
+            IndexJob {
+                uri: format!("at://{test_did}/app.bsky.feed.post/{rkey}"),
+                cid: "bafyreihhl5mpvjkrhnnagen2fomozzhnhhdq2jr6cego2nzbvmwewv5rd4".to_owned(),
+                action: WriteAction::Create,
+                record: Some(record),
+                indexed_at: "2026-11-25T10:00:00.000Z".to_owned(),
+                rev: "3lmediatime".to_owned(),
+                provenance: None,
+            }
+        };
+        let linked = |seconds: serde_json::Value| {
+            serde_json::json!({
+                "reply": reply,
+                "network.eurosky.mediaTime": {"$type": "network.eurosky.mediaTime", "seconds": seconds},
+            })
+        };
+        let delete = |create: &IndexJob| IndexJob {
+            action: WriteAction::Delete,
+            record: None,
+            cid: String::new(),
+            rev: "3lmediatime2".to_owned(),
+            ..create.clone()
+        };
+
+        let live = job("live", linked(serde_json::json!(41)));
+        let bulk = job("bulk", linked(serde_json::json!(50)));
+        // not kept: an invalid second, and a post that is not a reply
+        let invalid = job("invalid", linked(serde_json::json!(-3)));
+        let not_reply = job(
+            "notreply",
+            serde_json::json!({"network.eurosky.mediaTime": {"seconds": 7}}),
+        );
+        for created in [&live, &invalid] {
+            IndexerManager::process_job(&pool, created, false)
+                .await
+                .unwrap();
+        }
+        let (results, batch_failed) = IndexerManager::process_jobs_batch(
+            &pool,
+            &[
+                (b"bulk".to_vec(), bulk.clone()),
+                (b"notreply".to_vec(), not_reply.clone()),
+            ],
+            false,
+            false,
+        )
+        .await;
+        assert!(!batch_failed);
+        assert!(results.iter().all(|(_, r)| r.is_ok()), "{results:?}");
+
+        let rows = || async {
+            client
+                .query(
+                    "SELECT \"postUri\", \"parentUri\", seconds FROM post_media_time \
+                     WHERE \"postUri\" LIKE $1 ORDER BY seconds",
+                    &[&format!("at://{test_did}/%")],
+                )
+                .await
+                .unwrap()
+                .iter()
+                .map(|r| (r.get(0), r.get(1), r.get(2)))
+                .collect::<Vec<(String, String, i32)>>()
+        };
+        assert_eq!(
+            rows().await,
+            vec![
+                (live.uri.clone(), video.to_owned(), 41),
+                (bulk.uri.clone(), video.to_owned(), 50),
+            ]
+        );
+
+        // deleting a reply removes its row, on both paths
+        IndexerManager::process_job(&pool, &delete(&live), false)
+            .await
+            .unwrap();
+        let (results, batch_failed) = IndexerManager::process_jobs_batch(
+            &pool,
+            &[(b"bulk-delete".to_vec(), delete(&bulk))],
+            false,
+            false,
+        )
+        .await;
+        assert!(!batch_failed);
+        assert!(results.iter().all(|(_, r)| r.is_ok()), "{results:?}");
+        assert_eq!(rows().await, vec![]);
+
+        clear_rows().await;
+        cleanup_test_data(&pool, test_did).await;
+    }
+
+    #[tokio::test]
     async fn bulk_post_langs_tags_round_trip_as_arrays() {
         use crate::indexer::bulk::{self, PostCopyRow};
 

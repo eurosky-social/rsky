@@ -509,6 +509,7 @@ fn collection_tables(collection: &str) -> &'static [(&'static str, &'static str)
             ("quote", "uri"),
             ("post_embed_image", "\"postUri\""),
             ("post_embed_video", "\"postUri\""),
+            ("post_media_time", "\"postUri\""),
         ],
         "app.bsky.feed.repost" => &[("repost", "uri"), ("feed_item", "uri")],
         "app.bsky.feed.like" => &[("\"like\"", "uri")],
@@ -929,6 +930,7 @@ mod tests {
         assert!(tables.contains(&"post"));
         assert!(tables.contains(&"feed_item"));
         assert!(tables.contains(&"post_embed_image"));
+        assert!(tables.contains(&"post_media_time"));
         assert_eq!(
             collection_tables("com.example.custom"),
             &[] as &[(&str, &str)]
