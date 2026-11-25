@@ -1,7 +1,8 @@
 //! Reconciliation against a live Postgres (`DATABASE_URL`, default
 //! `postgresql://postgres:postgres@localhost:5432/bsky_test`) with the PDS
 //! mocked. The tables the workflow touches are created here, so a stock
-//! database suffices.
+//! database suffices, except for the test that indexes likes, which needs the
+//! appview schema (`tests/schema/appview.sql`) as the indexer tests do.
 
 use super::frontier::{Frontier, FrontierClient};
 use super::workflow::{
@@ -44,6 +45,35 @@ CREATE TABLE IF NOT EXISTS duplicate_record (
     cid varchar NOT NULL,
     \"duplicateOf\" varchar NOT NULL,
     \"indexedAt\" varchar NOT NULL
+);
+CREATE TABLE IF NOT EXISTS \"like\" (
+    uri varchar PRIMARY KEY,
+    cid varchar NOT NULL,
+    creator varchar NOT NULL,
+    subject varchar NOT NULL,
+    \"indexedAt\" varchar NOT NULL,
+    space_uri varchar
+);
+CREATE TABLE IF NOT EXISTS repost (
+    uri varchar PRIMARY KEY,
+    cid varchar NOT NULL,
+    creator varchar NOT NULL,
+    subject varchar NOT NULL,
+    \"indexedAt\" varchar NOT NULL
+);
+CREATE TABLE IF NOT EXISTS follow (
+    uri varchar PRIMARY KEY,
+    cid varchar NOT NULL,
+    creator varchar NOT NULL,
+    \"subjectDid\" varchar NOT NULL,
+    \"indexedAt\" varchar NOT NULL
+);
+CREATE TABLE IF NOT EXISTS actor_block (
+    uri varchar PRIMARY KEY,
+    cid varchar NOT NULL,
+    creator varchar NOT NULL,
+    \"subjectDid\" varchar NOT NULL,
+    \"indexedAt\" varchar NOT NULL
 );";
 
 async fn pool() -> Pool {
@@ -66,6 +96,7 @@ async fn reset_actor(pool: &Pool, did: &str) {
     let client = pool.get().await.unwrap();
     for statement in [
         "DELETE FROM record WHERE did = $1",
+        "DELETE FROM \"like\" WHERE creator = $1",
         "DELETE FROM actor WHERE did = $1",
         "DELETE FROM wintermute.did_progress WHERE did = $1",
         "DELETE FROM wintermute.did_generation WHERE did = $1",
@@ -107,12 +138,18 @@ struct TestRepo {
 
 impl TestRepo {
     async fn create(did: &str, notes: &[(&str, &str)]) -> Self {
+        Self::create_with(
+            did,
+            notes.iter().map(|(rkey, text)| note(rkey, text)).collect(),
+        )
+        .await
+    }
+
+    async fn create_with(did: &str, writes: Vec<RecordCreateOrUpdateOp>) -> Self {
         let keypair = keypair();
         let storage = Arc::new(tokio::sync::RwLock::new(
             MemoryBlockstore::new(None).await.unwrap(),
         ));
-        let writes: Vec<RecordCreateOrUpdateOp> =
-            notes.iter().map(|(rkey, text)| note(rkey, text)).collect();
         let repo = Repo::create(storage.clone(), did.to_owned(), &keypair, Some(writes))
             .await
             .unwrap();
@@ -242,6 +279,7 @@ fn options(did: &str) -> ReconcileOptions {
         reset_to_repo: false,
         break_glass: false,
         dry_run: false,
+        skip_boilerplate: false,
     }
 }
 
@@ -1169,5 +1207,95 @@ async fn a_commit_acknowledgement_is_retried_until_it_is_durable() {
         .batch_execute("DROP TRIGGER wintermute_test_refuse_batch_record ON record")
         .await
         .unwrap();
+    reset_actor(&pool, did).await;
+}
+
+#[tokio::test]
+async fn with_the_switch_on_likes_held_only_in_their_table_are_reconciled() {
+    let pool = pool().await;
+    let did = "did:plc:wintermute-typed-likes";
+    reset_actor(&pool, did).await;
+    let post = "at://did:plc:wintermute-typed-author/app.bsky.feed.post/p";
+    let like = |rkey: &str| RecordCreateOrUpdateOp {
+        action: WriteOpAction::Create,
+        collection: "app.bsky.feed.like".to_owned(),
+        rkey: rkey.to_owned(),
+        record: serde_json::from_value(json!({
+            "$type": "app.bsky.feed.like",
+            "subject": {"uri": post, "cid": "bafypost"},
+            "createdAt": "2026-01-01T00:00:00.000Z",
+        }))
+        .unwrap(),
+    };
+    let mut repo = TestRepo::create_with(did, vec![like("kept")]).await;
+    let cid = repo
+        .repo
+        .data
+        .list(None, None, None)
+        .await
+        .unwrap()
+        .remove(0)
+        .value
+        .to_string();
+    let rev = repo.rev();
+    let old_rev = format!("{}0", &rev[..rev.len() - 1]);
+    let uri = |rkey: &str| format!("at://{did}/app.bsky.feed.like/{rkey}");
+    // Indexed with the switch on: in the like table, not in `record`. The
+    // second one is a delete the AppView missed.
+    for (rkey, cid, subject) in [
+        ("kept", cid.as_str(), post),
+        (
+            "phantom",
+            "bafyphantom",
+            "at://did:plc:wintermute-typed-author/app.bsky.feed.post/q",
+        ),
+    ] {
+        let mut create = job(&uri(rkey), cid, &old_rev, WriteAction::Create, None);
+        create.record = Some(json!({
+            "$type": "app.bsky.feed.like",
+            "subject": {"uri": subject, "cid": "bafypost"},
+            "createdAt": "2026-01-01T00:00:00.000Z",
+        }));
+        IndexerManager::process_job(&pool, &create, true)
+            .await
+            .unwrap();
+    }
+    assert!(stored_revs(&pool, did).await.is_empty(), "no record rows");
+    let pds = MockPds::serving(
+        did,
+        repo.car().await,
+        &frontier(did, &repo.root(), &rev, true),
+    )
+    .await;
+
+    let report = reconcile(
+        &pool,
+        &pds.client,
+        &ReconcileOptions {
+            skip_boilerplate: true,
+            ..options(did)
+        },
+    )
+    .await
+    .unwrap();
+    drop(pds);
+
+    assert_eq!(report.phantoms_deleted, 1);
+    assert_eq!(report.records_inserted, 0, "the held like is not missing");
+    assert_eq!(report.records_overwritten, 0);
+    let client = pool.get().await.unwrap();
+    let likes: Vec<String> = client
+        .query("SELECT uri FROM \"like\" WHERE creator = $1", &[&did])
+        .await
+        .unwrap()
+        .iter()
+        .map(|row| row.get(0))
+        .collect();
+    assert_eq!(likes, vec![uri("kept")]);
+    assert!(
+        stored_revs(&pool, did).await.is_empty(),
+        "still no record rows"
+    );
+    drop(client);
     reset_actor(&pool, did).await;
 }

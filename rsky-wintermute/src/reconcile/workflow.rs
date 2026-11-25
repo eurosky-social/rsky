@@ -24,6 +24,7 @@ use std::sync::Arc;
 const ROOT_MATCH_ATTEMPTS: usize = 3;
 
 #[derive(Debug, Clone)]
+#[allow(clippy::struct_excessive_bools)] // independent switches, one per flag of `reindex_did`
 pub struct ReconcileOptions {
     pub did: String,
     pub workflow_id: String,
@@ -34,6 +35,9 @@ pub struct ReconcileOptions {
     pub break_glass: bool,
     /// Report what would change without fencing or writing.
     pub dry_run: bool,
+    /// `RECORD_SKIP_BOILERPLATE`: likes, reposts, follows and blocks are
+    /// written to and deleted from their typed tables only.
+    pub skip_boilerplate: bool,
 }
 
 /// Which completion branch a reconciliation took.
@@ -163,26 +167,24 @@ struct Downstream {
     rev: String,
 }
 
+/// What the appview holds for `did`, from `record` and the typed tables of
+/// likes, reposts, follows and blocks. A record with no revision kept, and
+/// one held only in its typed table, counts as revision `""`: older than any
+/// repository.
 async fn downstream_records(
     client: &Client,
     did: &str,
 ) -> Result<HashMap<String, Downstream>, WintermuteError> {
-    let rows = client
-        .query(
-            "SELECT uri, cid, COALESCE(rev, '') FROM record WHERE did = $1",
-            &[&did],
-        )
-        .await?;
-    Ok(rows
+    Ok(crate::held::holdings(client, did)
+        .await?
+        .records
         .into_iter()
-        .map(|row| {
-            (
-                row.get::<_, String>(0),
-                Downstream {
-                    cid: row.get(1),
-                    rev: row.get(2),
-                },
-            )
+        .map(|(uri, held)| {
+            let rev = match held.held_in {
+                crate::held::HeldIn::Record { rev } => rev.unwrap_or_default(),
+                crate::held::HeldIn::Typed { .. } => String::new(),
+            };
+            (uri, Downstream { cid: held.cid, rev })
         })
         .collect())
 }
@@ -624,7 +626,7 @@ async fn reconcile_fenced(
             pool,
             &plan.jobs,
             false,
-            false,
+            opts.skip_boilerplate,
             GateMode::Workflow(opts.workflow_id.clone()),
         )
         .await;
